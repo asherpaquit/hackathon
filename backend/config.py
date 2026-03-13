@@ -5,7 +5,12 @@ BASE_DIR = Path(__file__).parent.parent
 
 
 class Settings(BaseSettings):
-    # Ollama local LLM settings (free, no API key required)
+    # Local Ollama LLM settings — no API key required
+    # Speed tips (set in .env or environment):
+    #   OLLAMA_MODEL=llama3.2:3b         → ~3x faster than mistral:7b, great accuracy
+    #   OLLAMA_MODEL=qwen2.5:7b          → best structured JSON accuracy at 7B
+    #   OLLAMA_NUM_PARALLEL=4            → allow Ollama to run 4 concurrent requests
+    #                                      (set this env var before starting Ollama)
     ollama_model: str = "mistral:7b"
     ollama_host: str = "http://localhost:11434"
 

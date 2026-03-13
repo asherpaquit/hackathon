@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import anthropic
@@ -39,7 +40,106 @@ def _parse_json(text: str) -> Any:
     return json.loads(text)
 
 
-def extract_with_claude(extracted: dict, api_key: str) -> dict:
+def _extract_section_rates(
+    section: dict,
+    client: anthropic.Anthropic,
+    carrier: str,
+    contract_id: str,
+    effective_date: str,
+    expiration_date: str,
+    commodity: str,
+    surcharges: dict,
+) -> list[dict]:
+    """Extract rate rows for a single origin section (runs in a thread)."""
+    origin = section.get("origin", "")
+    origin_via = section.get("origin_via", "")
+    scope = section.get("scope", "")
+    raw_text = section.get("raw_text", "")
+
+    if not raw_text.strip() or not origin:
+        return []
+
+    prompt = RATES_PROMPT.format(
+        carrier=carrier,
+        contract_id=contract_id,
+        effective_date=effective_date,
+        expiration_date=expiration_date,
+        commodity=commodity,
+        scope=scope,
+        origin_city=origin,
+        origin_via=origin_via or "",
+        text=raw_text[:6000],
+    )
+    try:
+        raw = _call_claude(client, prompt, model=OPUS)
+        rows = _parse_json(raw)
+        if isinstance(rows, list):
+            for row in rows:
+                row.update({
+                    "carrier": carrier,
+                    "contract_id": contract_id,
+                    "effective_date": effective_date,
+                    "expiration_date": expiration_date,
+                    "commodity": commodity,
+                    "scope": scope,
+                    "origin_city": origin,
+                    "origin_via_city": origin_via or None,
+                    "ams_china_japan": _numeric(surcharges.get("ams_china_japan")),
+                    "hea_heavy_surcharge": _numeric(surcharges.get("hea_heavy_surcharge")),
+                    "agw": _numeric(surcharges.get("agw")),
+                    "rds_red_sea": _numeric(surcharges.get("rds_red_sea")),
+                })
+            return rows
+    except Exception as e:
+        print(f"[claude_extractor] Rate extraction failed for origin={origin}: {e}")
+    return []
+
+
+def _extract_arb_section(
+    arb_section: dict,
+    prompt_template,
+    client: anthropic.Anthropic,
+    carrier: str,
+    contract_id: str,
+    effective_date: str,
+    expiration_date: str,
+    commodity: str,
+    scope: str,
+) -> list[dict]:
+    """Extract arb rows for a single arb section (runs in a thread)."""
+    raw_text = arb_section.get("raw_text", "")
+    if not raw_text.strip():
+        return []
+
+    prompt = prompt_template.format(
+        carrier=carrier,
+        contract_id=contract_id,
+        effective_date=effective_date,
+        expiration_date=expiration_date,
+        commodity=commodity,
+        scope=scope,
+        text=raw_text[:6000],
+    )
+    try:
+        raw = _call_claude(client, prompt, model=OPUS)
+        rows = _parse_json(raw)
+        if isinstance(rows, list):
+            for row in rows:
+                row.update({
+                    "carrier": carrier,
+                    "contract_id": contract_id,
+                    "effective_date": effective_date,
+                    "expiration_date": expiration_date,
+                    "commodity": commodity,
+                    "scope": scope,
+                })
+            return rows
+    except Exception as e:
+        print(f"[claude_extractor] Arb extraction failed: {e}")
+    return []
+
+
+def extract_with_claude(extracted: dict, api_key: str, max_workers: int = 10) -> dict:
     """
     Main entry point: takes pdf_extractor output, calls Claude, returns structured data.
 
@@ -99,121 +199,62 @@ def extract_with_claude(extracted: dict, api_key: str) -> dict:
         except Exception:
             pass
 
-    # 3. Extract rate rows per section
+    # 3. Extract rate rows per section — parallel
     all_rates: list[dict] = []
     sections = extracted.get("sections", [])
 
-    for section in sections:
-        origin = section.get("origin", "")
-        origin_via = section.get("origin_via", "")
-        scope = section.get("scope", metadata.get("scope", ""))
-        raw_text = section.get("raw_text", "")
+    for s in sections:
+        if not s.get("scope"):
+            s["scope"] = metadata.get("scope", "")
 
-        if not raw_text.strip() or not origin:
-            continue
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                _extract_section_rates,
+                section, client,
+                carrier, contract_id, effective_date, expiration_date,
+                commodity, surcharges,
+            ): section.get("origin", "?")
+            for section in sections
+            if section.get("raw_text", "").strip() and section.get("origin")
+        }
+        for future in as_completed(futures):
+            all_rates.extend(future.result())
 
-        # Truncate very long sections to avoid token limits
-        text_chunk = raw_text[:6000]
-
-        prompt = RATES_PROMPT.format(
-            carrier=carrier,
-            contract_id=contract_id,
-            effective_date=effective_date,
-            expiration_date=expiration_date,
-            commodity=commodity,
-            scope=scope,
-            origin_city=origin,
-            origin_via=origin_via or "",
-            text=text_chunk,
-        )
-
-        try:
-            raw = _call_claude(client, prompt, model=OPUS)
-            rows = _parse_json(raw)
-            if isinstance(rows, list):
-                for row in rows:
-                    row.update({
-                        "carrier": carrier,
-                        "contract_id": contract_id,
-                        "effective_date": effective_date,
-                        "expiration_date": expiration_date,
-                        "commodity": commodity,
-                        "scope": scope,
-                        "origin_city": origin,
-                        "origin_via_city": origin_via or None,
-                        "ams_china_japan": _numeric(surcharges.get("ams_china_japan")),
-                        "hea_heavy_surcharge": _numeric(surcharges.get("hea_heavy_surcharge")),
-                        "agw": _numeric(surcharges.get("agw")),
-                        "rds_red_sea": _numeric(surcharges.get("rds_red_sea")),
-                    })
-                all_rates.extend(rows)
-        except Exception as e:
-            print(f"[claude_extractor] Rate extraction failed for origin={origin}: {e}")
-            continue
-
-    # 4. Extract origin arbitraries
+    # 4. Extract origin arbitraries — parallel
     origin_arbs: list[dict] = []
-    for arb_section in extracted.get("origin_arb_sections", []):
-        raw_text = arb_section.get("raw_text", "")
-        if not raw_text.strip():
-            continue
-        prompt = ORIGIN_ARB_PROMPT.format(
-            carrier=carrier,
-            contract_id=contract_id,
-            effective_date=effective_date,
-            expiration_date=expiration_date,
-            commodity=commodity,
-            scope=metadata.get("scope", ""),
-            text=raw_text[:6000],
-        )
-        try:
-            raw = _call_claude(client, prompt, model=OPUS)
-            rows = _parse_json(raw)
-            if isinstance(rows, list):
-                for row in rows:
-                    row.update({
-                        "carrier": carrier,
-                        "contract_id": contract_id,
-                        "effective_date": effective_date,
-                        "expiration_date": expiration_date,
-                        "commodity": commodity,
-                        "scope": metadata.get("scope", ""),
-                    })
-                origin_arbs.extend(rows)
-        except Exception as e:
-            print(f"[claude_extractor] Origin arb extraction failed: {e}")
+    scope = metadata.get("scope", "")
 
-    # 5. Extract destination arbitraries
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [
+            pool.submit(
+                _extract_arb_section,
+                arb_section, ORIGIN_ARB_PROMPT, client,
+                carrier, contract_id, effective_date, expiration_date,
+                commodity, scope,
+            )
+            for arb_section in extracted.get("origin_arb_sections", [])
+            if arb_section.get("raw_text", "").strip()
+        ]
+        for future in as_completed(futures):
+            origin_arbs.extend(future.result())
+
+    # 5. Extract destination arbitraries — parallel
     dest_arbs: list[dict] = []
-    for arb_section in extracted.get("dest_arb_sections", []):
-        raw_text = arb_section.get("raw_text", "")
-        if not raw_text.strip():
-            continue
-        prompt = DEST_ARB_PROMPT.format(
-            carrier=carrier,
-            contract_id=contract_id,
-            effective_date=effective_date,
-            expiration_date=expiration_date,
-            commodity=commodity,
-            scope=metadata.get("scope", ""),
-            text=raw_text[:6000],
-        )
-        try:
-            raw = _call_claude(client, prompt, model=OPUS)
-            rows = _parse_json(raw)
-            if isinstance(rows, list):
-                for row in rows:
-                    row.update({
-                        "carrier": carrier,
-                        "contract_id": contract_id,
-                        "effective_date": effective_date,
-                        "expiration_date": expiration_date,
-                        "commodity": commodity,
-                        "scope": metadata.get("scope", ""),
-                    })
-                dest_arbs.extend(rows)
-        except Exception as e:
-            print(f"[claude_extractor] Dest arb extraction failed: {e}")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [
+            pool.submit(
+                _extract_arb_section,
+                arb_section, DEST_ARB_PROMPT, client,
+                carrier, contract_id, effective_date, expiration_date,
+                commodity, scope,
+            )
+            for arb_section in extracted.get("dest_arb_sections", [])
+            if arb_section.get("raw_text", "").strip()
+        ]
+        for future in as_completed(futures):
+            dest_arbs.extend(future.result())
 
     return {
         "metadata": metadata,

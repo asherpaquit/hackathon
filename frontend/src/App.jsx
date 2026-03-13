@@ -109,7 +109,7 @@ export default function App() {
         </div>
         <div className="flex items-center gap-2">
           <Zap className="w-4 h-4 text-amber-400" />
-          <span className="text-sm text-slate-400">Powered by Claude AI</span>
+          <span className="text-sm text-slate-400">Local AI · No Cloud</span>
         </div>
       </header>
 
@@ -201,7 +201,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-[#334155] px-6 py-4 text-center text-xs text-slate-600">
-        FreightScan AI · Built for SoftPoint Hackathon 2026 · Powered by Claude AI
+        FreightScan AI · Built for SoftPoint Hackathon 2026
       </footer>
     </div>
   )
