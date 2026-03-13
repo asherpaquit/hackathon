@@ -1,0 +1,13 @@
+.env
+backend/uploads/
+outputs/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+frontend/node_modules/
+frontend/dist/
+
+*.xlsm.bak

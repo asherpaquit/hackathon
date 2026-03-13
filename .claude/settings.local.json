@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip --version)",
+      "Bash(pip3 --version)",
+      "Bash(pip install:*)",
+      "Bash(npm --version)",
+      "Bash(where tesseract:*)",
+      "Bash(where poppler:*)",
+      "Bash(where pdfinfo:*)",
+      "Bash(where pdftoppm:*)",
+      "Bash(python -c \":*)"
+    ]
+  }
+}

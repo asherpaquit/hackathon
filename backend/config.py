@@ -1,0 +1,19 @@
+from pydantic_settings import BaseSettings
+from pathlib import Path
+
+BASE_DIR = Path(__file__).parent.parent
+
+
+class Settings(BaseSettings):
+    anthropic_api_key: str = ""
+    upload_dir: Path = BASE_DIR / "backend" / "uploads"
+    output_dir: Path = BASE_DIR / "outputs"
+    template_path: Path = BASE_DIR / "templates" / "ATL0347N25 Template.xlsm"
+    max_upload_size_mb: int = 50
+
+    model_config = {"env_file": BASE_DIR / ".env", "env_file_encoding": "utf-8"}
+
+
+settings = Settings()
+settings.upload_dir.mkdir(parents=True, exist_ok=True)
+settings.output_dir.mkdir(parents=True, exist_ok=True)
