@@ -56,9 +56,13 @@ async def broadcast(job_id: str, data: dict):
 
 @app.get("/api/health")
 def health():
+    from ai.ollama_extractor import check_ollama_health
+    ollama_status = check_ollama_health(settings.ollama_host)
     return {
         "status": "ok",
-        "anthropic_key_set": bool(settings.anthropic_api_key),
+        "ollama_running": ollama_status["running"],
+        "ollama_model": settings.ollama_model,
+        "ollama_models_available": ollama_status.get("models", []),
         "template_exists": settings.template_path.exists(),
     }
 
@@ -155,7 +159,7 @@ async def ws_progress(websocket: WebSocket, job_id: str):
 
 async def run_pipeline(job_id: str):
     from extraction.pdf_extractor import extract_pdf
-    from ai.claude_extractor import extract_with_claude
+    from ai.ollama_extractor import extract_with_ollama
     from excel.excel_writer import write_excel
 
     job = jobs[job_id]
@@ -181,7 +185,11 @@ async def run_pipeline(job_id: str):
         await broadcast(job_id, {"status": "AI_PROCESSING", "stage_pct": 40})
 
         def do_ai():
-            return extract_with_claude(extracted, settings.anthropic_api_key)
+            return extract_with_ollama(
+                extracted,
+                model=settings.ollama_model,
+                host=settings.ollama_host,
+            )
 
         structured = await loop.run_in_executor(None, do_ai)
         rows_count = (

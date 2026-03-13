@@ -5,7 +5,10 @@ BASE_DIR = Path(__file__).parent.parent
 
 
 class Settings(BaseSettings):
-    anthropic_api_key: str = ""
+    # Ollama local LLM settings (free, no API key required)
+    ollama_model: str = "mistral:7b"
+    ollama_host: str = "http://localhost:11434"
+
     upload_dir: Path = BASE_DIR / "backend" / "uploads"
     output_dir: Path = BASE_DIR / "outputs"
     template_path: Path = BASE_DIR / "templates" / "ATL0347N25 Template.xlsm"
