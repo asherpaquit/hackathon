@@ -1,4 +1,4 @@
-"""Prompt templates for Claude AI freight data extraction."""
+"""Prompt templates for Ollama local LLM freight data extraction."""
 
 SYSTEM_PROMPT = (
     "You are a freight contract data extraction specialist. "
@@ -37,8 +37,12 @@ CONTRACT:
 - Origin: {origin_city}
 - Origin Via: {origin_via}
 
-SECTION TEXT:
+SECTION CONTENT (may include TABLE GRIDS in JSON format followed by raw text):
 {text}
+
+NOTE: If "TABLE GRIDS (JSON):" is present above, use the structured grid rows as the
+primary data source — column headers in the grid already identify 20', 40', 40HC, 45',
+destination, via port, etc. Raw text is supplementary context only.
 
 Return a JSON array. Each element:
 {{

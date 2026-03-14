@@ -166,7 +166,8 @@ async def run_pipeline(job_id: str):
     filepath = job["filepath"]
 
     try:
-        await broadcast(job_id, {"status": "EXTRACTING_TEXT", "stage_pct": 10})
+        await broadcast(job_id, {"status": "DOCLING_PROCESSING", "stage_pct": 10,
+                                  "message": "Parsing PDF structure with Docling…"})
 
         def do_extract():
             return extract_pdf(filepath)
@@ -175,11 +176,13 @@ async def run_pipeline(job_id: str):
         extracted = await loop.run_in_executor(None, do_extract)
 
         pages_total = extracted.get("pages_total", 0)
+        docling_used = extracted.get("_docling", False)
         await broadcast(job_id, {
             "status": "EXTRACTING_TEXT",
-            "stage_pct": 30,
+            "stage_pct": 35,
             "pages_total": pages_total,
             "pages_done": pages_total,
+            "message": f"{'Docling' if docling_used else 'pdfplumber'} extraction complete",
         })
 
         await broadcast(job_id, {"status": "AI_PROCESSING", "stage_pct": 40})
