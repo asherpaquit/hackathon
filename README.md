@@ -245,8 +245,6 @@ hackathon/
 │   └── src/
 │       └── components/
 │           └── ProgressPanel.jsx ← Progress bar with live ETA
-├── templates/
-│   └── ATL0347N25 Template.xlsm  ← DO NOT DELETE — required for output
 ├── .env                      ← Your settings (you create this)
 ├── README.md                 ← This file
 ├── PERFORMANCE_UPDATES.md    ← Speed optimization notes
@@ -274,7 +272,6 @@ Your computer doesn't have enough RAM for `mistral:7b`. Switch to `llama3.2:3b`:
 3. Restart the backend
 
 **Processing finished but the Excel file looks empty or wrong**
-- Make sure `templates/ATL0347N25 Template.xlsm` exists and hasn't been renamed
 - The PDF might use an unusual layout — check the terminal output for warnings
 
 **Port 8000 is already in use**
@@ -288,7 +285,6 @@ Then also update the frontend proxy in `frontend/vite.config.js` to point to por
 
 ## Important notes
 
-- Do **not** delete `templates/ATL0347N25 Template.xlsm` — the app cannot produce output without it
 - Ollama must be running **before** you start the backend
 - The `.env` file must be in the **root** folder (same level as `backend/` and `frontend/`), not inside `backend/`
 - Tested on Windows 10/11 and macOS. Linux should work with the same steps.
