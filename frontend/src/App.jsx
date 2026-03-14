@@ -129,10 +129,6 @@ export default function App() {
               Drop your PDF.<br />
               <span className="text-amber-400">Get your Excel.</span>
             </h2>
-            <p className="text-slate-400 text-lg max-w-xl mx-auto">
-              AI reads your shipping contracts and extracts all rate tables, surcharges, and
-              arbitraries directly into your template — in seconds.
-            </p>
           </motion.div>
         )}
 
