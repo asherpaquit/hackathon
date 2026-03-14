@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Ship, FileSpreadsheet, Zap } from 'lucide-react'
+import { Ship, FileSpreadsheet } from 'lucide-react'
 import DropZone from './components/DropZone'
 import FileQueue from './components/FileQueue'
 import ProgressPanel from './components/ProgressPanel'
@@ -107,10 +107,6 @@ export default function App() {
             <p className="text-xs text-slate-400 leading-none mt-0.5">PDF Contract → Excel</p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <Zap className="w-4 h-4 text-amber-400" />
-          <span className="text-sm text-slate-400">Local AI · No Cloud</span>
-        </div>
       </header>
 
       <main className="flex-1 max-w-7xl mx-auto w-full px-4 py-8 space-y-6">
@@ -129,10 +125,6 @@ export default function App() {
               Drop your PDF.<br />
               <span className="text-amber-400">Get your Excel.</span>
             </h2>
-            <p className="text-slate-400 text-lg max-w-xl mx-auto">
-              AI reads your shipping contracts and extracts all rate tables, surcharges, and
-              arbitraries directly into your template — in seconds.
-            </p>
           </motion.div>
         )}
 

@@ -18,18 +18,18 @@ export default function DropZone({ onFilesAccepted, compact = false }) {
   })
 
   return (
-    <motion.div
-      {...getRootProps()}
-      layout
-      className={`
-        relative cursor-pointer rounded-2xl border-2 border-dashed transition-all duration-300
-        ${isDragActive
-          ? 'border-amber-400 bg-amber-500/10 scale-[1.01]'
-          : 'border-[#334155] hover:border-amber-500/50 hover:bg-[#1e293b]/50'
-        }
-        ${compact ? 'p-6' : 'p-16'}
-      `}
-    >
+    <motion.div layout>
+      <div
+        {...getRootProps()}
+        className={`
+          relative cursor-pointer rounded-2xl border-2 border-dashed transition-all duration-300
+          ${isDragActive
+            ? 'border-amber-400 bg-amber-500/10 scale-[1.01]'
+            : 'border-[#334155] hover:border-amber-500/50 hover:bg-[#1e293b]/50'
+          }
+          ${compact ? 'p-6' : 'p-16'}
+        `}
+      >
       <input {...getInputProps()} />
 
       <div className={`flex flex-col items-center gap-3 text-center ${compact ? '' : 'py-4'}`}>
@@ -88,6 +88,7 @@ export default function DropZone({ onFilesAccepted, compact = false }) {
           }}
         />
       )}
+      </div>
     </motion.div>
   )
 }

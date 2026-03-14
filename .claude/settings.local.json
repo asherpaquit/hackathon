@@ -9,7 +9,14 @@
       "Bash(where poppler:*)",
       "Bash(where pdfinfo:*)",
       "Bash(where pdftoppm:*)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(ollama list:*)",
+      "Bash(curl -s http://localhost:11434/api/tags)",
+      "Read(//c/Users/Asher/AppData/Local/Programs/**)",
+      "Read(//c/Program Files/**)",
+      "Bash(pip show:*)",
+      "mcp__5295bc39-02bf-4e8f-87fa-bb0f2a8abafa__read_me",
+      "mcp__5295bc39-02bf-4e8f-87fa-bb0f2a8abafa__create_view"
     ]
   }
 }

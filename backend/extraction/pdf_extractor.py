@@ -1,4 +1,4 @@
-"""PDF extraction using Docling (whole-document, cached) with pdfplumber fallback."""
+"""PDF extraction: pdfplumber primary (fast, no PyTorch) with Docling fallback for scans."""
 
 from __future__ import annotations
 
@@ -14,6 +14,15 @@ logger = logging.getLogger("pdf_extractor")
 # ── Section detection patterns ────────────────────────────────────────────────
 ORIGIN_HEADER_RE  = re.compile(r"^\s*ORIGIN\s*:\s*(.+?)$",         re.IGNORECASE | re.MULTILINE)
 ORIGIN_VIA_RE     = re.compile(r"^\s*ORIGIN\s+VIA\s*:\s*(.+?)$",   re.IGNORECASE | re.MULTILINE)
+
+# Service-type parens at the END of an origin string: (CY), (CY/CY), (CFS), (FCL), (cy/cy) …
+# Handles upper and mixed case.  Applied first so later regexes don't see the parens.
+_ORIGIN_SERVICE_PARENS_RE = re.compile(r"\s*\([A-Za-z/]+\)\s*$")
+# Strips US/CA/AU/etc. 2-letter state/province code after a comma: ", CA", ", BC", ", NSW"
+_ORIGIN_STATE_RE          = re.compile(r",\s*[A-Z]{2}\s*$")
+# Strips written country name after a comma: ", UNITED STATES", ", CHINA", ", TAIWAN"
+# Requires ≥3 chars total after the first capital so 2-letter codes aren't matched here.
+_ORIGIN_COUNTRY_RE        = re.compile(r",\s*[A-Z][A-Za-z ]{2,}$")
 SCOPE_RE          = re.compile(r"^\s*\[(.+?)\]\s*$",                re.MULTILINE)
 ARBITRARY_RE      = re.compile(r"(ORIGIN|DESTINATION)\s+ARBITRAR",  re.IGNORECASE)
 SURCHARGE_RE      = re.compile(r"(surcharge|subject to|inclusive|AMS|HEA|AGW|RDS|red sea)", re.IGNORECASE)
@@ -32,20 +41,109 @@ COMMODITY_RE      = re.compile(r"Commodity\s*:\s*(.+?)(?:\n|$)",    re.IGNORECAS
 def extract_pdf(pdf_path: str) -> dict[str, Any]:
     """
     Extract all content from a freight contract PDF.
-    Tries Docling first (structured table grids + OCR), falls back to pdfplumber.
-    Docling raw output is cached to disk — re-processing the same PDF is instant.
+    Uses pdfplumber (fast, no AI models) as primary.
+    Falls back to Docling only if pdfplumber finds mostly image pages.
     """
     try:
-        return _extract_with_docling(pdf_path)
-    except ImportError:
-        logger.info("[pdf_extractor] Docling not installed — using pdfplumber fallback")
-        return _extract_with_pdfplumber(pdf_path)
+        result = _extract_with_pdfplumber(pdf_path)
+        # If pdfplumber got almost no text, try Docling (scanned PDF)
+        total_text = sum(len(s.get("raw_text", "")) for s in result.get("sections", []))
+        if total_text < 100 and result.get("pages_total", 0) > 2:
+            logger.info("[pdf_extractor] pdfplumber found almost no text — trying Docling for OCR")
+            try:
+                return _extract_with_docling(pdf_path)
+            except Exception as e:
+                logger.warning(f"[pdf_extractor] Docling also failed ({e}) — returning pdfplumber result")
+        return result
     except Exception as e:
-        logger.warning(f"[pdf_extractor] Docling failed ({e}) — using pdfplumber fallback")
-        return _extract_with_pdfplumber(pdf_path)
+        logger.warning(f"[pdf_extractor] pdfplumber failed ({e}) — trying Docling")
+        try:
+            return _extract_with_docling(pdf_path)
+        except Exception as e2:
+            logger.error(f"[pdf_extractor] Both extractors failed: {e2}")
+            raise
 
 
-# ── Docling path ──────────────────────────────────────────────────────────────
+# ── pdfplumber primary path (FAST — no PyTorch, no AI models) ────────────────
+
+def _extract_with_pdfplumber(pdf_path: str) -> dict[str, Any]:
+    import pdfplumber
+
+    path = Path(pdf_path)
+    result: dict[str, Any] = {
+        "metadata":            {},
+        "pages_total":         0,
+        "sections":            [],
+        "surcharge_text":      "",
+        "origin_arb_sections": [],
+        "dest_arb_sections":   [],
+        "_docling":            False,
+    }
+
+    elements: list[dict] = []
+
+    with pdfplumber.open(path) as pdf:
+        result["pages_total"] = len(pdf.pages)
+
+        for page_num, page in enumerate(pdf.pages, 1):
+            # Extract text
+            text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+            if text.strip():
+                elements.append({"type": "text", "page": page_num, "y": 0, "data": text})
+
+            # Extract tables as grids (same format Docling produces)
+            try:
+                tables = page.extract_tables({
+                    "vertical_strategy": "lines",
+                    "horizontal_strategy": "lines",
+                    "snap_tolerance": 5,
+                    "join_tolerance": 5,
+                    "min_words_vertical": 2,
+                    "min_words_horizontal": 1,
+                })
+                if not tables:
+                    # Retry with text strategy for tables without clear lines
+                    tables = page.extract_tables({
+                        "vertical_strategy": "text",
+                        "horizontal_strategy": "text",
+                        "snap_tolerance": 5,
+                        "min_words_vertical": 2,
+                    })
+            except Exception:
+                tables = []
+
+            for tbl in (tables or []):
+                grid = _clean_pdfplumber_table(tbl)
+                if grid and len(grid) >= 2:
+                    elements.append({"type": "table", "page": page_num, "y": 50, "data": grid})
+
+    if not elements:
+        return result
+
+    full_text = "\n".join(e["data"] for e in elements if e["type"] == "text")
+    result["metadata"] = _extract_metadata(full_text[:3000])
+    _split_sections_from_elements(elements, result)
+    return result
+
+
+def _clean_pdfplumber_table(table: list[list]) -> list[list[str]]:
+    """Clean pdfplumber table output into string grid."""
+    if not table:
+        return []
+    clean = []
+    for row in table:
+        if row is None:
+            continue
+        clean_row = []
+        for cell in row:
+            clean_row.append(str(cell).strip() if cell is not None else "")
+        # Skip completely empty rows
+        if any(c for c in clean_row):
+            clean.append(clean_row)
+    return clean
+
+
+# ── Docling fallback (for scanned/image PDFs only) ──────────────────────────
 
 def _pdf_sha256(path: Path) -> str:
     h = hashlib.sha256()
@@ -59,7 +157,7 @@ def _extract_with_docling(pdf_path: str) -> dict[str, Any]:
     from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (
-        PdfPipelineOptions, TableFormerMode, EasyOcrOptions,
+        PdfPipelineOptions, TableFormerMode,
     )
 
     path = Path(pdf_path)
@@ -78,10 +176,9 @@ def _extract_with_docling(pdf_path: str) -> dict[str, Any]:
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr                       = True
         pipeline_options.do_table_structure           = True
-        pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
-        pipeline_options.generate_page_images         = True
+        pipeline_options.table_structure_options.mode = TableFormerMode.FAST
+        pipeline_options.generate_page_images         = False
         pipeline_options.generate_picture_images      = False
-        pipeline_options.ocr_options                  = EasyOcrOptions(lang=["en"])
 
         converter = DocumentConverter(
             format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
@@ -135,7 +232,6 @@ def _build_elements(doc_dict: dict) -> list[dict]:
         y    = prov[0].get("bbox", {}).get("t", 0) if prov else 0
         elements.append({"type": "table", "page": page, "y": y, "data": grid})
 
-    # Sort top-to-bottom per page (Docling uses screen coords: t=0 at top, increases down)
     elements.sort(key=lambda e: (e["page"], e["y"]))
     return elements
 
@@ -153,8 +249,52 @@ def _normalize_grid(grid: list) -> list[list[str]]:
     return clean
 
 
+# ── Origin/Via name cleaner ──────────────────────────────────────────────────
+
+def _clean_origin_name(raw: str) -> str:
+    """
+    Strip noise from ORIGIN header values so only the city/port name remains.
+    Designed to be generic — handles all common freight contract formats.
+
+    Examples (all real formats seen in the wild):
+      "LOS ANGELES, CA, UNITED STATES(CY)"  → "LOS ANGELES"
+      "LOS ANGELES, CA, UNITED STATES (CY)" → "LOS ANGELES"
+      "SHANGHAI, CHINA(CY/CY)"              → "SHANGHAI"
+      "SHANGHAI, CN"                        → "SHANGHAI"
+      "YANTIAN, GUANGDONG, CN"              → "YANTIAN"
+      "BUSAN, KR"                           → "BUSAN"
+      "LOS ANGELES, CA"                     → "LOS ANGELES"
+      "NINGBO"                              → "NINGBO"
+      "NEW YORK/NEW JERSEY"                 → "NEW YORK/NEW JERSEY"
+    """
+    if not raw or not raw.strip():
+        return raw
+
+    s = raw.strip().upper()
+
+    # 1. Remove trailing service-type parens: (CY), (CY/CY), (CFS/CY), (FCL), etc.
+    #    Handles both "...(CY)" and "... (CY)" (with or without leading space)
+    s = _ORIGIN_SERVICE_PARENS_RE.sub("", s).strip()
+
+    # 2. Remove written country name: ", UNITED STATES", ", CHINA", ", TAIWAN"
+    #    Pattern requires ≥3 chars after first capital so 2-letter codes aren't matched here.
+    s = _ORIGIN_COUNTRY_RE.sub("", s).strip()
+
+    # 3. Remove 2-letter state/province code: ", CA", ", TX", ", BC", ", KR", etc.
+    s = _ORIGIN_STATE_RE.sub("", s).strip()
+
+    # 4. Take the first comma-delimited segment.
+    #    Handles any residual ", PROVINCE" or ", SUBREGION" leftovers.
+    city = s.split(",")[0].strip()
+
+    # Safety: never return empty string — fall back to the cleaned (uppercased) value
+    return city if city else s
+
+
+# ── Shared section splitting ─────────────────────────────────────────────────
+
 def _split_sections_from_elements(elements: list[dict], result: dict) -> None:
-    """Walk sorted Docling elements to build sections, arbitraries, and surcharge text."""
+    """Walk sorted elements to build sections, arbitraries, and surcharge text."""
     current_scope   = ""
     current_origin  = ""
     current_via     = ""
@@ -230,14 +370,15 @@ def _split_sections_from_elements(elements: list[dict], result: dict) -> None:
         origin_m = ORIGIN_HEADER_RE.match(text)
         if origin_m:
             flush_section()
-            current_origin = origin_m.group(1).strip()
+            current_origin = _clean_origin_name(origin_m.group(1))
             current_via    = ""
             in_arb         = None
             continue
 
         via_m = ORIGIN_VIA_RE.match(text)
         if via_m:
-            current_via = via_m.group(1).strip()
+            # Via lines also often have country/state suffixes — clean them too
+            current_via = _clean_origin_name(via_m.group(1))
             continue
 
         if SURCHARGE_RE.search(text):
@@ -251,59 +392,7 @@ def _split_sections_from_elements(elements: list[dict], result: dict) -> None:
     result["surcharge_text"] = "\n".join(surcharge_lines)
 
 
-# ── pdfplumber fallback ───────────────────────────────────────────────────────
-
-def _extract_with_pdfplumber(pdf_path: str) -> dict[str, Any]:
-    import pdfplumber
-    from extraction.page_classifier import classify_page
-
-    path = Path(pdf_path)
-    result: dict[str, Any] = {
-        "metadata":            {},
-        "pages_total":         0,
-        "sections":            [],
-        "surcharge_text":      "",
-        "origin_arb_sections": [],
-        "dest_arb_sections":   [],
-        "_docling":            False,
-    }
-
-    with pdfplumber.open(path) as pdf:
-        result["pages_total"] = len(pdf.pages)
-        all_text_parts: list[str] = []
-        for page in pdf.pages:
-            classification = classify_page(page)
-            if classification == "text":
-                text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
-            elif classification == "image":
-                text = _ocr_page(page)
-            else:
-                text = ""
-            all_text_parts.append(text)
-
-        full_text = "\n".join(all_text_parts)
-        result["metadata"] = _extract_metadata(full_text[:3000])
-        _split_sections_text(full_text, result)
-
-    return result
-
-
-def _ocr_page(page) -> str:
-    try:
-        import shutil
-        import io
-        from PIL import Image
-
-        img = page.to_image(resolution=200).original
-        if shutil.which("tesseract"):
-            import pytesseract
-            return pytesseract.image_to_string(img, config="--oem 3 --psm 6")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return f"[IMAGE_PAGE_BYTES:{buf.getvalue().hex()[:40]}...]"
-    except Exception as e:
-        return f"[OCR_ERROR: {e}]"
-
+# ── Metadata extraction ──────────────────────────────────────────────────────
 
 def _extract_metadata(text: str) -> dict:
     meta: dict[str, str] = {}
@@ -327,85 +416,3 @@ def _extract_metadata(text: str) -> dict:
     meta["commodity"] = m.group(1).strip() if m else ""
 
     return meta
-
-
-def _split_sections_text(full_text: str, result: dict) -> None:
-    """Original text-based section splitting for the pdfplumber fallback path."""
-    lines           = full_text.split("\n")
-    current_scope   = ""
-    current_origin  = ""
-    current_via     = ""
-    current_lines:  list[str] = []
-    in_arb          = None
-    arb_type        = None
-    arb_lines:      list[str] = []
-    surcharge_lines: list[str] = []
-
-    def flush_section():
-        nonlocal current_origin, current_via, current_lines
-        if current_origin and current_lines:
-            result["sections"].append({
-                "origin":     current_origin,
-                "origin_via": current_via,
-                "scope":      current_scope,
-                "raw_text":   "\n".join(current_lines),
-                "tables":     [],
-            })
-        current_origin = ""
-        current_via    = ""
-        current_lines  = []
-
-    def flush_arb():
-        nonlocal arb_type, arb_lines
-        if arb_type and arb_lines:
-            entry = {"type": arb_type, "raw_text": "\n".join(arb_lines), "tables": []}
-            if arb_type == "ORIGIN":
-                result["origin_arb_sections"].append(entry)
-            else:
-                result["dest_arb_sections"].append(entry)
-        arb_type  = None
-        arb_lines = []
-
-    for line in lines:
-        stripped = line.strip()
-
-        scope_m = SCOPE_RE.match(stripped)
-        if scope_m:
-            current_scope = scope_m.group(1).strip()
-            continue
-
-        arb_m = ARBITRARY_RE.search(stripped)
-        if arb_m:
-            flush_section()
-            flush_arb()
-            in_arb    = arb_m.group(1).upper()
-            arb_type  = in_arb
-            arb_lines = [line]
-            continue
-
-        if in_arb:
-            arb_lines.append(line)
-            continue
-
-        origin_m = ORIGIN_HEADER_RE.match(stripped)
-        if origin_m:
-            flush_section()
-            current_origin = origin_m.group(1).strip()
-            current_via    = ""
-            in_arb         = None
-            continue
-
-        via_m = ORIGIN_VIA_RE.match(stripped)
-        if via_m:
-            current_via = via_m.group(1).strip()
-            continue
-
-        if SURCHARGE_RE.search(stripped):
-            surcharge_lines.append(stripped)
-
-        if current_origin:
-            current_lines.append(line)
-
-    flush_section()
-    flush_arb()
-    result["surcharge_text"] = "\n".join(surcharge_lines)

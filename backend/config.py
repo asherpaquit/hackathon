@@ -5,14 +5,16 @@ BASE_DIR = Path(__file__).parent.parent
 
 
 class Settings(BaseSettings):
-    # Local Ollama LLM settings — no API key required
-    # Speed tips (set in .env or environment):
-    #   OLLAMA_MODEL=llama3.2:3b         → ~3x faster than mistral:7b, great accuracy
-    #   OLLAMA_MODEL=qwen2.5:7b          → best structured JSON accuracy at 7B
-    #   OLLAMA_NUM_PARALLEL=4            → allow Ollama to run 4 concurrent requests
-    #                                      (set this env var before starting Ollama)
+    # Model selection (set in .env):
+    #   OLLAMA_MODEL=qwen2.5:3b    → best for 4GB VRAM GPUs (GTX 1050 Ti, GTX 1650)
+    #   OLLAMA_MODEL=llama3.2:3b   → fallback for 8GB RAM no-GPU builds
+    #   OLLAMA_MODEL=mistral:7b    → best accuracy, needs 8GB VRAM or 16GB RAM
     ollama_model: str = "mistral:7b"
     ollama_host: str = "http://localhost:11434"
+
+    # LOW_MEMORY_MODE=true → reduces workers, context window, and input size
+    # Use this on machines with 8GB RAM (e.g. Ryzen 3 3200G + GTX 1050 Ti)
+    low_memory_mode: bool = False
 
     upload_dir: Path = BASE_DIR / "backend" / "uploads"
     output_dir: Path = BASE_DIR / "outputs"

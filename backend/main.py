@@ -192,6 +192,7 @@ async def run_pipeline(job_id: str):
                 extracted,
                 model=settings.ollama_model,
                 host=settings.ollama_host,
+                low_memory=settings.low_memory_mode,
             )
 
         structured = await loop.run_in_executor(None, do_ai)
