@@ -11,3 +11,19 @@ frontend/node_modules/
 frontend/dist/
 
 *.xlsm.bak
+
+# Virtual environments
+backend/venv/
+venv/
+env/
+
+# Test/output directories
+oltek_extract_new/
+our_extract_new/
+
+# Local config
+.claude/settings.local.json
+
+# Sample files
+sample_contract.pdf
+make_sample_pdf.py
