@@ -79,5 +79,4 @@ Open `http://localhost:5173`.
 ## Notes
 
 - Ollama must be running before starting the backend
-- Do not delete `templates/ATL0347N25 Template.xlsm` — it's required for Excel output
 - Tested on Windows; Mac/Linux should work with the same steps
