@@ -172,7 +172,7 @@ async def run_pipeline(job_id: str):
         def do_extract():
             return extract_pdf(filepath)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         extracted = await loop.run_in_executor(None, do_extract)
 
         pages_total = extracted.get("pages_total", 0)

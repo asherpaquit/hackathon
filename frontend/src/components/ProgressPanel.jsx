@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
 import { Check, FileText, Brain, Table2, Download, Upload, Cpu, Clock } from 'lucide-react'
 
@@ -39,31 +39,21 @@ export default function ProgressPanel({ job }) {
   const isComplete  = job.status === 'COMPLETE'
   const isActive    = !isError && !isComplete && job.status !== 'UPLOADED'
 
-  // Track when processing actually started
-  const startedAtRef = useRef(null)
-  const [elapsed, setElapsed]   = useState(0)
-  const [totalTime, setTotalTime] = useState(null) // how long it took when done
-
-  // Set startedAt on first active status
-  useEffect(() => {
-    if (isActive && !startedAtRef.current) {
-      startedAtRef.current = Date.now()
-    }
-    if (isComplete && startedAtRef.current && totalTime === null) {
-      setTotalTime(Math.floor((Date.now() - startedAtRef.current) / 1000))
-    }
-  }, [job.status])
-
-  // Live elapsed counter
+  // Tick every second while active to refresh elapsed display
+  const [, setTick] = useState(0)
   useEffect(() => {
     if (!isActive) return
-    const iv = setInterval(() => {
-      if (startedAtRef.current) {
-        setElapsed(Math.floor((Date.now() - startedAtRef.current) / 1000))
-      }
-    }, 1000)
+    const iv = setInterval(() => setTick(t => t + 1), 1000)
     return () => clearInterval(iv)
   }, [isActive])
+
+  // Derive elapsed from job-level timestamps — accurate even when switching jobs
+  const elapsed = job.started_at
+    ? Math.floor(((job.ended_at || Date.now()) - job.started_at) / 1000)
+    : 0
+  const totalTime = job.started_at && job.ended_at
+    ? Math.floor((job.ended_at - job.started_at) / 1000)
+    : null
 
   // ETA estimation — only meaningful once we have enough data (pct > 8, elapsed > 15s)
   const pct = job.stage_pct || 0

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -58,24 +60,43 @@ def _call_ollama(
         },
     }
     client = _get_client()
-    response = client.post(f"{host}/api/chat", json=payload)
-    response.raise_for_status()
-    return response.json()["message"]["content"]
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = client.post(f"{host}/api/chat", json=payload, timeout=120.0)
+            response.raise_for_status()
+            return response.json()["message"]["content"]
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(attempt + 1)   # 1 s, 2 s
+    raise last_err  # type: ignore[misc]
+
+
+def _repair_json(text: str) -> str:
+    """Fix common LLM JSON formatting mistakes before parsing."""
+    # Strip markdown code fences
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$", "", text)
+    # Remove JS-style inline comments  // ...
+    text = re.sub(r"//[^\n\"]*", "", text)
+    # Remove trailing commas before ] or }
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    return text.strip()
 
 
 def _parse_json(text: str) -> Any:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+    text = _repair_json(text)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    for pattern in [r"(\[.*\])", r"(\{.*\})"]:
-        m = re.search(pattern, text, re.DOTALL)
+    # Try to extract the first array or object from the text
+    for pattern in [r"(\[[\s\S]*\])", r"(\{[\s\S]*\})"]:
+        m = re.search(pattern, text)
         if m:
             try:
-                return json.loads(m.group(1))
+                return json.loads(_repair_json(m.group(1)))
             except json.JSONDecodeError:
                 continue
     logger.warning(f"[ollama_extractor] JSON parse failed. Raw: {text[:300]}")
@@ -95,58 +116,101 @@ def check_ollama_health(host: str = "http://localhost:11434") -> dict:
 
 # ── Text pre-filter ───────────────────────────────────────────────────────────
 
-_SEPARATOR_RE = re.compile(r"^[-=_*~\s]{3,}$")
+_SEPARATOR_RE   = re.compile(r"^[-=_*~\s]{3,}$")
+_PAGE_HEADER_RE = re.compile(r"^(page\s*\d+|^\d+\s*$)", re.IGNORECASE)
 
 
 def _prefilter_text(text: str, max_chars: int = 4000) -> str:
+    """
+    Remove blank lines, separator lines, and page-number lines.
+    Also deduplicate lines that repeat 3+ times (boilerplate headers/footers).
+    Reduces token count by ~30-50% which speeds up small models significantly.
+    """
     lines = text.split("\n")
-    kept  = [l for l in lines if l.strip() and not _SEPARATOR_RE.match(l.strip())]
+    counts: dict[str, int] = {}
+    kept: list[str] = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        if _SEPARATOR_RE.match(s):
+            continue
+        if _PAGE_HEADER_RE.match(s):
+            continue
+        counts[s] = counts.get(s, 0) + 1
+        if counts[s] <= 2:           # Allow at most 2 occurrences (header + 1 repeat)
+            kept.append(line)
     return "\n".join(kept)[:max_chars]
 
 
 # ── Rule-based grid extraction ────────────────────────────────────────────────
 
 _RATE_COL: dict[str, str] = {
+    # ── 20' containers ──────────────────────────────────────────────────────────
     "20": "base_rate_20", "20'": "base_rate_20", '20"': "base_rate_20",
     "20ft": "base_rate_20", "20gp": "base_rate_20", "20'gp": "base_rate_20",
     "20st": "base_rate_20", "20'st": "base_rate_20",
+    "20dc": "base_rate_20", "20'dc": "base_rate_20",
+    "20dv": "base_rate_20", "20'dv": "base_rate_20",
+    "teu": "base_rate_20",                          # Twenty-foot Equivalent Unit
+    "r20": "base_rate_20", "rate20": "base_rate_20", "rate 20": "base_rate_20",
+    "20'gp/dc": "base_rate_20",
+    # ── 40' containers ──────────────────────────────────────────────────────────
     "40": "base_rate_40", "40'": "base_rate_40", '40"': "base_rate_40",
     "40ft": "base_rate_40", "40gp": "base_rate_40", "40'gp": "base_rate_40",
     "40dv": "base_rate_40", "40'dv": "base_rate_40",
+    "40dc": "base_rate_40", "40'dc": "base_rate_40",
     "40st": "base_rate_40", "40'st": "base_rate_40",
+    "feu": "base_rate_40",                          # Forty-foot Equivalent Unit
+    "r40": "base_rate_40", "rate40": "base_rate_40", "rate 40": "base_rate_40",
+    "40'gp/dc": "base_rate_40",
+    # ── 40HC containers ─────────────────────────────────────────────────────────
     "40hc": "base_rate_40h", "40h": "base_rate_40h", "40hq": "base_rate_40h",
     "40'hc": "base_rate_40h", "40'h": "base_rate_40h", "40'hq": "base_rate_40h",
     "40hicube": "base_rate_40h", "40hi": "base_rate_40h", "hc40": "base_rate_40h",
     "40'hi": "base_rate_40h", "40rhc": "base_rate_40h",
+    "hc": "base_rate_40h", "hq": "base_rate_40h",  # standalone column headers
+    "hi cube": "base_rate_40h", "high cube": "base_rate_40h", "highcube": "base_rate_40h",
+    "40hc/hq": "base_rate_40h", "40'hc/hq": "base_rate_40h",
+    # ── 45' containers ──────────────────────────────────────────────────────────
     "45": "base_rate_45", "45'": "base_rate_45", '45"': "base_rate_45",
     "45ft": "base_rate_45", "45hc": "base_rate_45", "45'hc": "base_rate_45",
     "45hq": "base_rate_45", "45'hq": "base_rate_45",
-    # Destination columns
+    # ── Destination ─────────────────────────────────────────────────────────────
     "destination": "destination_city", "dest": "destination_city",
     "pod": "destination_city", "port of discharge": "destination_city",
     "portof discharge": "destination_city", "discharge port": "destination_city",
-    "destination port": "destination_city", "del": "destination_city",
-    "place of delivery": "destination_city", "final dest": "destination_city",
-    # Via columns
+    "discharging port": "destination_city", "destination port": "destination_city",
+    "del": "destination_city", "place of delivery": "destination_city",
+    "final dest": "destination_city", "fpod": "destination_city",
+    "delivery": "destination_city", "delivery point": "destination_city",
+    "discharge": "destination_city", "unloading": "destination_city",
+    "unloading port": "destination_city", "to port": "destination_city",
+    "portname": "destination_city", "port name": "destination_city",
+    # ── Via / transshipment ─────────────────────────────────────────────────────
     "via": "destination_via_city", "dest via": "destination_via_city",
     "destination via": "destination_via_city", "t/s": "destination_via_city",
     "t/s port": "destination_via_city", "transship": "destination_via_city",
     "tranship": "destination_via_city", "transhipment": "destination_via_city",
     "transshipment": "destination_via_city", "ts port": "destination_via_city",
-    # Service
+    "t/s via": "destination_via_city", "via port": "destination_via_city",
+    # ── Service ─────────────────────────────────────────────────────────────────
     "service": "service", "term": "service", "type": "service",
     "mode": "service", "service type": "service", "svc": "service",
-    "move type": "service", "terms": "service",
-    # Remarks / notes
+    "move type": "service", "terms": "service", "incoterm": "service",
+    # ── Remarks / notes ─────────────────────────────────────────────────────────
     "remarks": "remarks", "remark": "remarks", "note": "remarks",
     "notes": "remarks", "comment": "remarks", "comments": "remarks",
-    # Columns to map to remarks (carry through for reference)
     "direct call": "remarks", "directcall": "remarks",
-    # Explicitly ignored columns — mapped to a sentinel so they're recognised but skipped
-    # (the extractor skips any field not starting with base_rate/agw/known fields)
+    # ── Explicitly ignored ───────────────────────────────────────────────────────
     "cntry": "_ignore", "country": "_ignore",
-    "cur": "_ignore", "currency": "_ignore",
+    "cur": "_ignore", "currency": "_ignore", "ccy": "_ignore", "usd": "_ignore",
     "loading port": "_ignore", "pol": "_ignore",
+    "no": "_ignore", "no.": "_ignore", "seq": "_ignore",
+    "#": "_ignore", "item": "_ignore", "sr": "_ignore",
+    "unit": "_ignore", "validity": "_ignore", "valid": "_ignore",
+    "effective": "_ignore", "expiry": "_ignore",
+    "40ot": "_ignore", "40fr": "_ignore",   # Open Top / Flat Rack — not tracked
 }
 
 _ARB_ORIGIN_EXTRA: dict[str, str] = {
@@ -169,6 +233,17 @@ _ARB_DEST_EXTRA: dict[str, str] = {
 # Handles plain numbers like "360" AND commodity/rate codes like "R2/2298" → extracts 2298
 _NUMERIC_RE = re.compile(r"(?:[A-Za-z]\d*/)?(\d[\d,]*(?:\.\d+)?)")
 
+# Sane bounds for ocean freight rates in USD — rejects obviously wrong values
+_RATE_BOUNDS: dict[str, tuple[float, float]] = {
+    "base_rate_20":  (10.0, 30_000.0),
+    "base_rate_40":  (10.0, 45_000.0),
+    "base_rate_40h": (10.0, 48_000.0),
+    "base_rate_45":  (10.0, 50_000.0),
+    "agw_20":  (0.0, 6_000.0),
+    "agw_40":  (0.0, 6_000.0),
+    "agw_45":  (0.0, 6_000.0),
+}
+
 
 def _normalize_header_key(cell: str) -> str:
     s = (cell.lower().strip()
@@ -189,19 +264,46 @@ def _detect_header_row(
     if col_source is None:
         col_source = _RATE_COL
 
+    # Pre-build compact-key lookup once per call
+    compact_source = {re.sub(r"[^a-z0-9]", "", k): v for k, v in col_source.items()}
+
     for row_idx, row in enumerate(grid[:8]):
         col_map: dict[int, str] = {}
         for col_idx, cell in enumerate(row):
+            if not cell or not cell.strip():
+                continue
             key = _normalize_header_key(cell)
+
+            # 1. Exact normalized match
             if key in col_source:
                 col_map[col_idx] = col_source[key]
-            else:
-                # Fuzzy: try removing all spaces/punctuation
-                compact = re.sub(r"[^a-z0-9]", "", key)
-                for known, field in col_source.items():
-                    if compact == re.sub(r"[^a-z0-9]", "", known):
+                continue
+
+            # 2. Compact match (strip all non-alphanumeric)
+            compact = re.sub(r"[^a-z0-9]", "", key)
+            if compact in compact_source:
+                col_map[col_idx] = compact_source[compact]
+                continue
+
+            # 3. Token-level match — split "BASE RATE 40HC" into tokens and
+            #    check each token (and adjacent pairs) against the lookup.
+            #    Only used for rate/destination/via columns to avoid false hits.
+            tokens = re.split(r"[\s/'\"\-]+", key)
+            for i, tok in enumerate(tokens):
+                tok_compact = re.sub(r"[^a-z0-9]", "", tok)
+                if tok_compact in compact_source:
+                    field = compact_source[tok_compact]
+                    if field.startswith(("base_rate", "destination", "via")):
                         col_map[col_idx] = field
                         break
+                # Also try pairs of adjacent tokens: "40 hc" → "40hc"
+                if i + 1 < len(tokens):
+                    pair = tok_compact + re.sub(r"[^a-z0-9]", "", tokens[i + 1])
+                    if pair in compact_source:
+                        field = compact_source[pair]
+                        if field.startswith(("base_rate", "destination", "via")):
+                            col_map[col_idx] = field
+                            break
 
         rate_fields = [v for v in col_map.values() if v.startswith("base_rate")]
         if len(rate_fields) >= 2:
@@ -241,6 +343,10 @@ def _extract_from_grid(
                 if m:
                     try:
                         val = float(m.group(1).replace(",", ""))
+                        bounds = _RATE_BOUNDS.get(field)
+                        if bounds and not (bounds[0] <= val <= bounds[1]):
+                            logger.debug(f"[rule] Rate out of bounds: {field}={val}, skipping")
+                            continue
                         row_dict[field] = val
                         if field.startswith("base_rate"):
                             has_rate = True
@@ -430,7 +536,7 @@ def extract_with_ollama(
     extracted: dict,
     model: str = "mistral:7b",
     host: str = "http://localhost:11434",
-    max_workers: int = 4,
+    max_workers: int = 0,           # 0 = auto-detect from CPU count
     low_memory: bool = False,
 ) -> dict:
     """
@@ -440,6 +546,11 @@ def extract_with_ollama(
     """
     if low_memory:
         max_workers = 2
+    elif max_workers <= 0:
+        # Rule-based tasks complete in <1ms and saturate quickly.
+        # LLM tasks are bottlenecked by Ollama (serial inference), so >4 workers
+        # doesn't help for LLM but doesn't hurt either.
+        max_workers = min(os.cpu_count() or 4, 8)
 
     metadata = extracted.get("metadata", {})
     carrier         = metadata.get("carrier", "")

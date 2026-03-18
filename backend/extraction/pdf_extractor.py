@@ -41,24 +41,32 @@ COMMODITY_RE      = re.compile(r"Commodity\s*:\s*(.+?)(?:\n|$)",    re.IGNORECAS
 def extract_pdf(pdf_path: str) -> dict[str, Any]:
     """
     Extract all content from a freight contract PDF.
-    Uses pdfplumber (fast, no AI models) as primary.
+    Uses pdfplumber (fast, no heavy deps) as primary.
     Falls back to Docling only if pdfplumber finds mostly image pages.
     """
     try:
         result = _extract_with_pdfplumber(pdf_path)
-        # If pdfplumber got almost no text, try Docling (scanned PDF)
         total_text = sum(len(s.get("raw_text", "")) for s in result.get("sections", []))
         if total_text < 100 and result.get("pages_total", 0) > 2:
             logger.info("[pdf_extractor] pdfplumber found almost no text — trying Docling for OCR")
             try:
                 return _extract_with_docling(pdf_path)
+            except ImportError:
+                logger.warning("[pdf_extractor] Docling not installed — returning pdfplumber result as-is. "
+                               "Install optional deps (docling, easyocr) for scanned PDF support.")
             except Exception as e:
-                logger.warning(f"[pdf_extractor] Docling also failed ({e}) — returning pdfplumber result")
+                logger.warning(f"[pdf_extractor] Docling failed ({e}) — returning pdfplumber result")
         return result
     except Exception as e:
         logger.warning(f"[pdf_extractor] pdfplumber failed ({e}) — trying Docling")
         try:
             return _extract_with_docling(pdf_path)
+        except ImportError:
+            logger.error("[pdf_extractor] Docling not installed. Install optional deps for scanned PDF support.")
+            raise RuntimeError(
+                "Could not extract text from PDF. "
+                "For scanned PDFs install: docling easyocr (see requirements.txt)"
+            ) from e
         except Exception as e2:
             logger.error(f"[pdf_extractor] Both extractors failed: {e2}")
             raise
@@ -66,13 +74,22 @@ def extract_pdf(pdf_path: str) -> dict[str, Any]:
 
 # ── pdfplumber primary path (FAST — no PyTorch, no AI models) ────────────────
 
+def _get_page_count_fast(pdf_path: str) -> int:
+    """Use pypdf for instant page count — no full parse needed."""
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(pdf_path).pages)
+    except Exception:
+        return 0
+
+
 def _extract_with_pdfplumber(pdf_path: str) -> dict[str, Any]:
     import pdfplumber
 
     path = Path(pdf_path)
     result: dict[str, Any] = {
         "metadata":            {},
-        "pages_total":         0,
+        "pages_total":         _get_page_count_fast(pdf_path),  # fast pre-count
         "sections":            [],
         "surcharge_text":      "",
         "origin_arb_sections": [],
@@ -91,26 +108,9 @@ def _extract_with_pdfplumber(pdf_path: str) -> dict[str, Any]:
             if text.strip():
                 elements.append({"type": "text", "page": page_num, "y": 0, "data": text})
 
-            # Extract tables as grids (same format Docling produces)
-            try:
-                tables = page.extract_tables({
-                    "vertical_strategy": "lines",
-                    "horizontal_strategy": "lines",
-                    "snap_tolerance": 5,
-                    "join_tolerance": 5,
-                    "min_words_vertical": 2,
-                    "min_words_horizontal": 1,
-                })
-                if not tables:
-                    # Retry with text strategy for tables without clear lines
-                    tables = page.extract_tables({
-                        "vertical_strategy": "text",
-                        "horizontal_strategy": "text",
-                        "snap_tolerance": 5,
-                        "min_words_vertical": 2,
-                    })
-            except Exception:
-                tables = []
+            # Multi-strategy table extraction (PDF Skill technique):
+            # try three strategies in order and keep the one with the most data.
+            tables = _extract_tables_best_strategy(page)
 
             for tbl in (tables or []):
                 grid = _clean_pdfplumber_table(tbl)
@@ -124,6 +124,55 @@ def _extract_with_pdfplumber(pdf_path: str) -> dict[str, Any]:
     result["metadata"] = _extract_metadata(full_text[:3000])
     _split_sections_from_elements(elements, result)
     return result
+
+
+def _extract_tables_best_strategy(page) -> list:
+    """
+    Try three extraction strategies and return whichever finds the most data.
+    Based on PDF Skill reference.md — pdfplumber multi-strategy extraction.
+    Strategy 1: line-based  — best for tables with explicit borders (most freight PDFs).
+    Strategy 2: text-based  — best for borderless column-aligned tables.
+    Strategy 3: hybrid      — lines for vertical, text for horizontal (mixed layouts).
+    """
+    def _non_empty_cells(tables):
+        return sum(1 for t in tables for row in t for cell in row if cell and str(cell).strip())
+
+    strategies = [
+        {   # Strategy 1: explicit grid lines
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "lines",
+            "snap_tolerance": 5,
+            "join_tolerance": 5,
+            "min_words_vertical": 2,
+            "min_words_horizontal": 1,
+        },
+        {   # Strategy 2: whitespace / text column alignment
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+            "snap_tolerance": 5,
+            "min_words_vertical": 2,
+            "min_words_horizontal": 1,
+        },
+        {   # Strategy 3: hybrid — line-split rows, text-split columns
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "text",
+            "snap_tolerance": 4,
+            "join_tolerance": 4,
+            "min_words_vertical": 1,
+            "min_words_horizontal": 1,
+        },
+    ]
+
+    best, best_score = [], 0
+    for settings in strategies:
+        try:
+            tables = page.extract_tables(settings) or []
+            score = _non_empty_cells(tables)
+            if score > best_score:
+                best, best_score = tables, score
+        except Exception:
+            continue
+    return best
 
 
 def _clean_pdfplumber_table(table: list[list]) -> list[list[str]]:

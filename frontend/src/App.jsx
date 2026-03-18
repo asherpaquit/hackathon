@@ -12,17 +12,60 @@ const API = ''  // Same origin in production; proxied in dev
 
 export default function App() {
   const [jobs, setJobs] = useState([])   // [{job_id, filename, status, ...}]
-  const [activeJob, setActiveJob] = useState(null)
+  const [activeJobId, setActiveJobId] = useState(null)
   const [previewRows, setPreviewRows] = useState([])
 
+  // Derive activeJob directly from the jobs array so it is ALWAYS the latest
+  // state — no stale closure possible. Any setJobs call automatically updates
+  // what ProgressPanel sees without needing a separate setActiveJob.
+  const activeJob = jobs.find(j => j.job_id === activeJobId) || null
+
+  // updateJob only needs to touch setJobs — no dependency on activeJob at all.
+  // This makes it a stable reference ([] deps) so WebSocket onmessage handlers
+  // never capture a stale version of this callback.
   const updateJob = useCallback((job_id, patch) => {
     setJobs(prev =>
-      prev.map(j => (j.job_id === job_id ? { ...j, ...patch } : j))
+      prev.map(j => {
+        if (j.job_id !== job_id) return j
+        const updated = { ...j, ...patch }
+        // Stamp started_at on first active status transition
+        if (!j.started_at && patch.status && patch.status !== 'UPLOADED') {
+          updated.started_at = Date.now()
+        }
+        // Stamp ended_at on terminal status
+        if (!j.ended_at && (patch.status === 'COMPLETE' || patch.status === 'ERROR')) {
+          updated.ended_at = Date.now()
+        }
+        return updated
+      })
     )
-    if (activeJob?.job_id === job_id) {
-      setActiveJob(prev => ({ ...prev, ...patch }))
+  }, [])
+
+  const startJob = useCallback(async (job_id) => {
+    const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    const wsHost = window.location.hostname === 'localhost' ? 'localhost:8000' : window.location.host
+    const ws = new WebSocket(`${wsProto}://${wsHost}/ws/progress/${job_id}`)
+
+    ws.onmessage = (e) => {
+      const data = JSON.parse(e.data)
+      updateJob(job_id, data)
+
+      if (data.status === 'COMPLETE') {
+        ws.close()
+        axios.get(`${API}/api/preview/${job_id}`).then(res => {
+          setPreviewRows(res.data.rows || [])
+        })
+      }
     }
-  }, [activeJob])
+
+    ws.onerror = () => ws.close()
+
+    try {
+      await axios.post(`${API}/api/process/${job_id}`)
+    } catch (e) {
+      updateJob(job_id, { status: 'ERROR', error: e.response?.data?.detail || e.message })
+    }
+  }, [updateJob])
 
   const onFilesAccepted = useCallback(async (files) => {
     const form = new FormData()
@@ -48,42 +91,13 @@ export default function App() {
     }))
     setJobs(prev => [...prev, ...newJobs])
 
-    // Auto-start processing for each job
     for (const j of newJobs) {
       startJob(j.job_id)
     }
-  }, [])
-
-  const startJob = useCallback(async (job_id) => {
-    // Open WebSocket for progress
-    const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-    const wsHost = window.location.hostname === 'localhost' ? 'localhost:8000' : window.location.host
-    const ws = new WebSocket(`${wsProto}://${wsHost}/ws/progress/${job_id}`)
-
-    ws.onmessage = (e) => {
-      const data = JSON.parse(e.data)
-      updateJob(job_id, data)
-
-      if (data.status === 'COMPLETE') {
-        ws.close()
-        // Fetch preview data
-        axios.get(`${API}/api/preview/${job_id}`).then(res => {
-          setPreviewRows(res.data.rows || [])
-        })
-      }
-    }
-
-    ws.onerror = () => ws.close()
-
-    try {
-      await axios.post(`${API}/api/process/${job_id}`)
-    } catch (e) {
-      updateJob(job_id, { status: 'ERROR', error: e.response?.data?.detail || e.message })
-    }
-  }, [updateJob])
+  }, [startJob])
 
   const selectJob = useCallback((job) => {
-    setActiveJob(job)
+    setActiveJobId(job.job_id)
     if (job.status === 'COMPLETE') {
       axios.get(`${API}/api/preview/${job.job_id}`).then(res => {
         setPreviewRows(res.data.rows || [])
@@ -143,7 +157,7 @@ export default function App() {
               <div className="lg:col-span-1 space-y-4">
                 <FileQueue
                   jobs={jobs}
-                  activeJobId={activeJob?.job_id}
+                  activeJobId={activeJobId}
                   onSelect={selectJob}
                 />
               </div>
@@ -152,7 +166,7 @@ export default function App() {
               <div className="lg:col-span-2 space-y-4">
                 {activeJob ? (
                   <>
-                    <ProgressPanel job={activeJob} />
+                    <ProgressPanel key={activeJobId} job={activeJob} />
                     {activeJob.status === 'COMPLETE' && (
                       <>
                         <DownloadButton job={activeJob} />

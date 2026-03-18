@@ -16,7 +16,11 @@
       "Read(//c/Program Files/**)",
       "Bash(pip show:*)",
       "mcp__5295bc39-02bf-4e8f-87fa-bb0f2a8abafa__read_me",
-      "mcp__5295bc39-02bf-4e8f-87fa-bb0f2a8abafa__create_view"
+      "mcp__5295bc39-02bf-4e8f-87fa-bb0f2a8abafa__create_view",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(gh api:*)",
+      "Bash(curl:*)",
+      "Bash(find C:UsersAdministratorDocumentsGithubsoftpoint-mobilehackathon -maxdepth 2 -name *.txt -o -name *.env -o -name *.cfg -o -name *.toml -o -name *.ini)"
     ]
   }
 }
