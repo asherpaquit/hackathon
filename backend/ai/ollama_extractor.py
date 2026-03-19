@@ -177,7 +177,11 @@ _RATE_COL: dict[str, str] = {
     "t/s via": "destination_via_city", "via port": "destination_via_city",
     "trunk lane": "destination_via_city",           # ATL0347N25 arb table column
     # ── Service ─────────────────────────────────────────────────────────────────
-    "service": "service", "term": "service", "type": "service",
+    "service": "service", "term": "service",
+    # "type" intentionally NOT mapped to service — in OLTK contracts the Type
+    # column holds cargo type ("Dry", "RF") which overwrites the correct Term
+    # value ("CY", "Door").  Map it to _ignore so Term wins.
+    "type": "_ignore",
     "mode": "service", "service type": "service", "svc": "service",
     "move type": "service", "terms": "service", "incoterm": "service",
     "service lane": "service",                      # ATL0347N25 arb table column
@@ -454,6 +458,40 @@ def _extract_rates_from_text(text: str, context: dict) -> list[dict]:
             rows.append(row)
 
     return rows
+
+
+# "Rates are valid to 20251231"  (end-only format used in LAX RF sections)
+_DATE_VALID_TO_RE = re.compile(r"valid\s+to\s+(\d{4})(\d{2})(\d{2})", re.I)
+
+
+def _extract_section_dates(
+    section_text: str,
+    fallback_effective: str,
+    fallback_expiry: str,
+) -> tuple[str, str]:
+    """
+    Extract validity dates from per-commodity NOTE blocks embedded in section text.
+
+    Handles two formats used in OLTK contracts:
+      "Rates are valid from 20250401 to 20250630"   → effective + expiry
+      "Rates are valid to 20251231"                 → expiry only
+
+    Falls back to the provided values when no NOTE dates are found.
+    """
+    # "valid from YYYYMMDD to YYYYMMDD" — full range
+    m = _DATE_YYYYMMDD_RE.search(section_text)
+    if m:
+        eff = _yyyymmdd_to_dmy(m.group(1), m.group(2), m.group(3))
+        exp = _yyyymmdd_to_dmy(m.group(4), m.group(5), m.group(6))
+        return eff, exp
+
+    # "valid to YYYYMMDD" — end date only
+    m = _DATE_VALID_TO_RE.search(section_text)
+    if m:
+        exp = _yyyymmdd_to_dmy(m.group(1), m.group(2), m.group(3))
+        return fallback_effective, exp
+
+    return fallback_effective, fallback_expiry
 
 
 # ── Context-aware table parsing ───────────────────────────────────────────────
@@ -985,11 +1023,10 @@ def extract_with_ollama(
     All data is extracted using regex and rule-based grid parsing.
     """
     metadata = extracted.get("metadata", {})
+    sections = extracted.get("sections", [])
 
-    # Enhance metadata with wider regex patterns
-    full_text = "\n".join(
-        s.get("raw_text", "") for s in extracted.get("sections", [])
-    )[:4000]
+    # Enhance metadata with wider regex patterns (search first 4000 chars of all sections)
+    full_text = "\n".join(s.get("raw_text", "") for s in sections)[:4000]
     metadata = _extract_metadata_enhanced(full_text, metadata)
 
     carrier         = metadata.get("carrier", "")
@@ -999,7 +1036,17 @@ def extract_with_ollama(
     commodity       = metadata.get("commodity", "")
     scope           = metadata.get("scope", "")
 
-    sections = extracted.get("sections", [])
+    # If no expiration date was found in the contract header, scan all section
+    # texts for per-commodity NOTE blocks ("valid from/to YYYYMMDD").
+    # These are the ONLY expiry source in many OLTK contracts.
+    if not expiration_date:
+        for s in sections:
+            _, found_exp = _extract_section_dates(s.get("raw_text", ""), "", "")
+            if found_exp:
+                expiration_date = found_exp
+                logger.info(f"[nlp] Expiration from NOTE block: {expiration_date}")
+                break
+
     for s in sections:
         if not s.get("scope"):
             s["scope"] = scope
@@ -1019,22 +1066,44 @@ def extract_with_ollama(
         surcharges.update(found)
         logger.info(f"[nlp] Surcharges: {found}")
 
-    # Extract rates for all sections
+    # ── Rate extraction with commodity + expiry carry-forward ─────────────────
+    #
+    # In OLTK contracts the commodity and validity dates are declared in
+    # "< NOTE FOR COMMODITY >" blocks that appear at the END of a section's
+    # text (after the rate table), immediately before the next ORIGIN: header.
+    # pdfplumber places this text in the CURRENT section's raw_text, not the
+    # next one.  We therefore:
+    #   1. Process the current section using the RUNNING state.
+    #   2. After processing, update the running state from any NOTE found in
+    #      the current section's raw_text — these apply to subsequent sections.
     all_rates: list[dict] = []
+    running_commodity = commodity
+    running_expiry    = expiration_date
+
     for section in sections:
+        raw = section.get("raw_text", "")
+
         rows = _extract_section_rates(
             section, carrier, contract_id,
-            effective_date, expiration_date,
-            commodity, surcharges,
+            effective_date, running_expiry,
+            running_commodity, surcharges,
         )
         all_rates.extend(rows)
+
+        # Update running state from NOTE blocks in this section's text.
+        # _infer_section_commodity also catches "COMMODITY : ..." lines.
+        running_commodity = _infer_section_commodity(raw, running_commodity)
+        _, found_exp = _extract_section_dates(raw, effective_date, running_expiry)
+        if found_exp != running_expiry:
+            logger.debug(f"[nlp] Expiry carry-forward: {running_expiry} → {found_exp}")
+            running_expiry = found_exp
 
     # Extract origin arbitraries
     origin_arbs: list[dict] = []
     for arb in extracted.get("origin_arb_sections", []):
         rows = _extract_arb_section(
             arb, "ORIGIN", carrier, contract_id,
-            effective_date, expiration_date, commodity, scope,
+            effective_date, running_expiry, running_commodity, scope,
         )
         origin_arbs.extend(rows)
 
@@ -1043,7 +1112,7 @@ def extract_with_ollama(
     for arb in extracted.get("dest_arb_sections", []):
         rows = _extract_arb_section(
             arb, "DESTINATION", carrier, contract_id,
-            effective_date, expiration_date, commodity, scope,
+            effective_date, running_expiry, running_commodity, scope,
         )
         dest_arbs.extend(rows)
 

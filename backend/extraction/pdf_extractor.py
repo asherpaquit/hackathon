@@ -27,6 +27,10 @@ SCOPE_RE          = re.compile(r"^\s*\[(.+?)\]\s*$",                re.MULTILINE
 ARBITRARY_RE      = re.compile(r"(ORIGIN|DESTINATION)\s+ARBITRAR",  re.IGNORECASE)
 SURCHARGE_RE      = re.compile(r"(surcharge|subject to|inclusive|AMS|HEA|AGW|RDS|red sea)", re.IGNORECASE)
 
+# Matches "1) COMMODITY : Wood pulp..." or "COMMODITY : Beer, Chilled"
+# These lines appear BEFORE the ORIGIN: header and carry the commodity context.
+COMMODITY_HDR_RE  = re.compile(r"^\s*(?:\d+\)\s*)?COMMODITY\s*[:\-]\s*(.+)$", re.IGNORECASE)
+
 # Contract header patterns
 CONTRACT_NO_RE    = re.compile(r"SERVICE\s+CONTRACT\s+NO[.:]?\s*([A-Z0-9]+)|Contract\s+No[.:]?\s*([A-Z0-9]+)", re.IGNORECASE)
 CARRIER_ABBREV_RE = re.compile(r"^([A-Z]{2,6})\s+SERVICE\s+CONTRACT", re.MULTILINE)
@@ -103,10 +107,14 @@ def _extract_with_pdfplumber(pdf_path: str) -> dict[str, Any]:
         result["pages_total"] = len(pdf.pages)
 
         for page_num, page in enumerate(pdf.pages, 1):
-            # Extract text
+            # Extract text and split into individual lines so that the section
+            # splitter (designed for Docling's per-block output) can match
+            # ORIGIN:, [SCOPE], and COMMODITY: patterns that appear mid-page.
             text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
-            if text.strip():
-                elements.append({"type": "text", "page": page_num, "y": 0, "data": text})
+            for line in text.split("\n"):
+                line = line.strip()
+                if line:
+                    elements.append({"type": "text", "page": page_num, "y": 0, "data": line})
 
             # Multi-strategy table extraction (PDF Skill technique):
             # try three strategies in order and keep the one with the most data.
@@ -356,10 +364,18 @@ def _split_sections_from_elements(elements: list[dict], result: dict) -> None:
     surcharge_lines: list[str]            = []
     # Buffer for consecutive ORIGIN: headers that share one rate table
     pending_origins: list[tuple[str, str]] = []  # (origin, via) pairs
+    # Commodity lines that appear BEFORE the first ORIGIN: on a page.
+    # They are prepended to the next section's raw_text so that
+    # _infer_section_commodity() and the carry-forward in extract_with_ollama
+    # can propagate the commodity and dates to the correct sections.
+    pending_commodity_lines: list[str] = []
 
     def flush_section():
-        nonlocal current_origin, current_via, current_texts, current_tables, pending_origins
+        nonlocal current_origin, current_via, current_texts, current_tables
+        nonlocal pending_origins, pending_commodity_lines
         if current_origin and (current_texts or current_tables):
+            # Prepend any pending commodity lines so they appear in raw_text.
+            all_text = pending_commodity_lines + current_texts
             # Emit one section per pending origin (all share the same table/text)
             all_origins = pending_origins + [(current_origin, current_via)]
             for orig, via in all_origins:
@@ -367,10 +383,11 @@ def _split_sections_from_elements(elements: list[dict], result: dict) -> None:
                     "origin":     orig,
                     "origin_via": via,
                     "scope":      current_scope,
-                    "raw_text":   "\n".join(current_texts),
+                    "raw_text":   "\n".join(all_text),
                     "tables":     list(current_tables),
                 })
         pending_origins = []
+        pending_commodity_lines = []
         current_origin = ""
         current_via    = ""
         current_texts  = []
@@ -402,6 +419,8 @@ def _split_sections_from_elements(elements: list[dict], result: dict) -> None:
 
         text = elem["data"]
 
+        # ── Scope header: "[NORTH AMERICA - ASIA (WB)]" ──────────────────────
+        # Now that pages are split into individual lines this matches correctly.
         scope_m = SCOPE_RE.match(text)
         if scope_m:
             current_scope = scope_m.group(1).strip()
@@ -422,6 +441,7 @@ def _split_sections_from_elements(elements: list[dict], result: dict) -> None:
                 surcharge_lines.append(text)
             continue
 
+        # ── ORIGIN: header ────────────────────────────────────────────────────
         origin_m = ORIGIN_HEADER_RE.match(text)
         if origin_m:
             new_origin = _clean_origin_name(origin_m.group(1))
@@ -439,6 +459,19 @@ def _split_sections_from_elements(elements: list[dict], result: dict) -> None:
         if via_m:
             # Via lines also often have country/state suffixes — clean them too
             current_via = _clean_origin_name(via_m.group(1))
+            continue
+
+        # ── Commodity header: "1) COMMODITY : Wood pulp..." ──────────────────
+        # These appear BEFORE the ORIGIN: line on each commodity group page.
+        # Store in pending_commodity_lines so the subsequent section can find them.
+        cmdt_m = COMMODITY_HDR_RE.match(text)
+        if cmdt_m:
+            if current_origin:
+                # Already inside a section — add normally (also stored below)
+                current_texts.append(text)
+            else:
+                # Before any ORIGIN: header — buffer for the next section
+                pending_commodity_lines.append(text)
             continue
 
         if SURCHARGE_RE.search(text):
