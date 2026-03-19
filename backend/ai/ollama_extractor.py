@@ -456,6 +456,340 @@ def _extract_rates_from_text(text: str, context: dict) -> list[dict]:
     return rows
 
 
+# ── Context-aware table parsing ───────────────────────────────────────────────
+
+# 1.  Per-section commodity inference
+# Matches explicit commodity declarations embedded in section text.
+_COMMODITY_INLINE_RE = re.compile(
+    r"(?:"
+    r"<\s*NOTE\s+FOR\s+COMMODITY[:\s]+"           # < NOTE FOR COMMODITY: FAK >
+    r"|COMMODITY\s*[:\-]\s*"                        # COMMODITY: ALL CARGO
+    r"|CMDT\s*[:\-]\s*"                             # CMDT: FAK
+    r")([^\n<>]{2,80}?)(?:\s*>|\s*$)",
+    re.I,
+)
+
+_COMMODITY_KW_RES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"freight\s+all\s+kinds?",   re.I), "FAK"),
+    (re.compile(r"\bfak\b",                  re.I), "FAK"),
+    (re.compile(r"all\s+cargo",              re.I), "ALL CARGO"),
+    (re.compile(r"all\s+commodit",           re.I), "ALL CARGO"),
+    (re.compile(r"general\s+cargo",          re.I), "GENERAL CARGO"),
+    (re.compile(r"dangerous\s+goods?",       re.I), "HAZARDOUS"),
+    (re.compile(r"\bimdg\b",                 re.I), "HAZARDOUS"),
+    (re.compile(r"hazardous",                re.I), "HAZARDOUS"),
+    (re.compile(r"\breefer\b",               re.I), "REEFER"),
+    (re.compile(r"refrigerated",             re.I), "REEFER"),
+    (re.compile(r"household\s+goods?",       re.I), "HOUSEHOLD GOODS"),
+    (re.compile(r"personal\s+effects?",      re.I), "PERSONAL EFFECTS"),
+    (re.compile(r"project\s+cargo",          re.I), "PROJECT CARGO"),
+    (re.compile(r"\bnvocc\b",                re.I), "NVOCC"),
+    (re.compile(r"automotive",               re.I), "AUTOMOTIVE"),
+    (re.compile(r"electronics?",             re.I), "ELECTRONICS"),
+    (re.compile(r"garments?",                re.I), "GARMENT"),
+    (re.compile(r"textiles?",                re.I), "TEXTILE"),
+    (re.compile(r"machin(?:ery|es?)",        re.I), "MACHINERY"),
+    (re.compile(r"chemical",                 re.I), "CHEMICAL"),
+    (re.compile(r"furniture",                re.I), "FURNITURE"),
+]
+
+# 2.  Via / transshipment inference from free text
+#     Matches: "VIA SINGAPORE", "ROUTING VIA: HK", "T/S AT KAOHSIUNG", "T/S BUSAN"
+_VIA_TEXT_RE = re.compile(
+    r"(?:^|[\s,;])"
+    r"(?:VIA|ROUTING\s+VIA|ROUTE\s+VIA|T/S(?:\s+AT)?|TRANSSHIP(?:MENT)?\s+(?:AT|VIA))"
+    r"\s*[:\-]?\s*"
+    r"([A-Z][A-Z ]{2,28}?)(?:\s*[,\.;\(\n]|$)",
+    re.I | re.MULTILINE,
+)
+
+# Stop-words that should never be treated as via port names
+_VIA_STOPWORDS = re.compile(r"^(THE|AND|OR|IN|AT|OF|TO|FROM|FOR|BY|WITH|AS|IS|BE)$", re.I)
+
+
+def _infer_section_commodity(section_text: str, global_commodity: str) -> str:
+    """
+    Infer the commodity for a section from its raw text.
+
+    Priority order:
+      1. Explicit inline declaration  (< NOTE FOR COMMODITY: FAK >, COMMODITY: …)
+      2. Keyword pattern match        (reefer, hazardous, fak, etc.)
+      3. Fallback to global_commodity (unchanged)
+    """
+    if not section_text:
+        return global_commodity
+
+    # 1. Explicit declaration
+    m = _COMMODITY_INLINE_RE.search(section_text)
+    if m:
+        found = m.group(1).strip().rstrip(">").strip()
+        if found:
+            return found.upper()
+
+    # 2. Keyword scan
+    for kw_re, canonical in _COMMODITY_KW_RES:
+        if kw_re.search(section_text):
+            return canonical
+
+    return global_commodity
+
+
+def _infer_via_from_text(section_text: str, existing_via: str) -> str:
+    """
+    Extract the via/transshipment port from section free-text when no
+    ORIGIN VIA: header is present.
+
+    Common source patterns:
+      "ROUTING: … VIA SINGAPORE"
+      "T/S AT HONG KONG"
+      "T/S BUSAN"
+    Returns existing_via unchanged if it is already set.
+    """
+    if existing_via or not section_text:
+        return existing_via
+
+    m = _VIA_TEXT_RE.search(section_text)
+    if not m:
+        return existing_via
+
+    via = m.group(1).strip().rstrip(".,;").strip()
+
+    # Sanity guards: must be ≥3 chars and not a stop-word
+    if len(via) < 3 or _VIA_STOPWORDS.match(via):
+        return existing_via
+
+    # Strip trailing service parens and state/country suffixes
+    via = re.sub(r"\s*\([A-Za-z/]+\)\s*$", "", via)
+    via = re.sub(r",\s*[A-Z]{2}\s*$", "", via.upper()).strip()
+    via = via.split(",")[0].strip()
+
+    return via if via else existing_via
+
+
+def _split_multiline_cells(grid: list[list[str]]) -> list[list[str]]:
+    """
+    Expand table cells that contain embedded newlines (\\n) into separate rows.
+
+    pdfplumber sometimes folds what should be multiple rows into one cell when
+    the PDF uses borderless tables with tight row spacing.  For example:
+
+        cell = "SHANGHAI\\nNINGBO"  →  two separate city names on consecutive rows
+
+    Each column is split independently; columns with fewer lines are padded with
+    empty strings so all sub-rows have the same width.
+    """
+    expanded: list[list[str]] = []
+    for row in grid:
+        if not any("\n" in cell for cell in row):
+            expanded.append(row)
+            continue
+
+        split_cols = [cell.split("\n") for cell in row]
+        max_lines = max(len(sc) for sc in split_cols)
+
+        if max_lines == 1:
+            expanded.append(row)
+            continue
+
+        # Pad shorter columns to the same line count
+        for sc in split_cols:
+            while len(sc) < max_lines:
+                sc.append("")
+
+        for line_idx in range(max_lines):
+            sub_row = [sc[line_idx].strip() for sc in split_cols]
+            if any(c for c in sub_row):
+                expanded.append(sub_row)
+
+    return expanded
+
+
+def _detect_continuation_table(
+    grid: list[list[str]],
+    prev_col_map: dict[int, str] | None,
+) -> dict[int, str] | None:
+    """
+    Detect whether a table is a page-break continuation of the previous one.
+
+    When a rate table spans multiple pages, pdfplumber creates one table object
+    per page.  The first has a header row; subsequent ones do not.  The current
+    grid extractor returns None for headerless tables, silently dropping all rows
+    on continuation pages.
+
+    A table is treated as a continuation when ALL of the following hold:
+      • A previous column-map exists (from the table on the preceding page)
+      • The first row of this table does NOT look like a header
+        (fewer than 2 cells match known column-name keywords)
+      • The column count is within ±2 of the expected count
+      • The first row contains at least one numeric-looking rate value
+
+    Returns a col_map trimmed to this table's actual column count,
+    or None if the table is not a continuation.
+    """
+    if prev_col_map is None or not grid:
+        return None
+
+    first_row = grid[0]
+    actual_cols = len(first_row)
+
+    # Reject if first row looks like a fresh header
+    compact_keys = {re.sub(r"[^a-z0-9]", "", k) for k in _RATE_COL}
+    header_hits = sum(
+        1 for cell in first_row
+        if re.sub(r"[^a-z0-9]", "", cell.lower()) in compact_keys
+    )
+    if header_hits >= 2:
+        return None
+
+    # Column count must roughly match the previous table
+    expected_cols = max(prev_col_map.keys()) + 1
+    if abs(actual_cols - expected_cols) > 2:
+        return None
+
+    # At least one cell in the first row must contain a rate-like number
+    has_numeric = any(
+        re.search(r"(?:[A-Za-z]\d*/)?(\d{2,6})", cell)
+        for cell in first_row if cell.strip()
+    )
+    if not has_numeric:
+        return None
+
+    # Return col_map trimmed to valid column indices
+    return {k: v for k, v in prev_col_map.items() if k < actual_cols}
+
+
+def _extract_rows_with_colmap(
+    grid: list[list[str]],
+    col_map: dict[int, str],
+    context: dict,
+) -> list[dict]:
+    """
+    Extract data rows from a grid using a pre-determined column map.
+    Used for continuation tables where the header row is on a previous page.
+    Starts from row 0 (no header detection).
+    """
+    rows: list[dict] = []
+    for row in grid:
+        if not any(c.strip() for c in row):
+            continue
+
+        row_dict = dict(context)
+        has_rate = False
+
+        for col_idx, field in col_map.items():
+            if field == "_ignore":
+                continue
+            if col_idx >= len(row):
+                continue
+            cell = row[col_idx].strip()
+            if not cell or cell in ("-", "—", "--", "N/A", "n/a", "TBN", "None"):
+                continue
+
+            if field.startswith("base_rate") or field.startswith("agw"):
+                m = _NUMERIC_RE.search(cell)
+                if m:
+                    try:
+                        val = float(m.group(1).replace(",", ""))
+                        bounds = _RATE_BOUNDS.get(field)
+                        if bounds and not (bounds[0] <= val <= bounds[1]):
+                            logger.debug(f"[cont] OOB: {field}={val}")
+                            continue
+                        row_dict[field] = val
+                        if field.startswith("base_rate"):
+                            has_rate = True
+                    except ValueError:
+                        pass
+            else:
+                row_dict[field] = cell
+
+        if has_rate:
+            row_dict.setdefault("service", "CY/CY")
+            rows.append(row_dict)
+
+    return rows
+
+
+def _extract_origin_grouped_from_table(
+    grid: list[list[str]],
+    col_source: dict[str, str],
+) -> dict[str, list[dict]] | None:
+    """
+    Handle rate tables where origin/POL is a column rather than an ORIGIN: header.
+
+    Some freight PDFs consolidate multiple origins into one large table:
+
+        | Origin      | Destination | 20'  | 40'  | 40HC |
+        | LOS ANGELES | SHANGHAI    | 1200 | 2200 | 2400 |
+        |             | NINGBO      | 1150 | 2150 | 2350 |   ← origin carried forward
+        | SEATTLE     | SHANGHAI    | 1100 | 2100 | 2300 |
+
+    The origin cell is often blank on continuation rows — carried forward from
+    the last non-empty value above (standard freight table convention).
+
+    Returns a dict  {origin_city: [row_dict, ...]}  grouped by origin,
+    or None if no origin column is found in the table.
+    """
+    header_idx, col_map = _detect_header_row(grid, col_source)
+    if header_idx == -1:
+        return None
+
+    origin_col = next(
+        (idx for idx, field in col_map.items() if field == "origin_city"), None
+    )
+    if origin_col is None:
+        return None  # No origin column — handled by ORIGIN: section header
+
+    groups: dict[str, list[dict]] = {}
+    current_origin: str = ""
+
+    for row in grid[header_idx + 1:]:
+        if not any(c.strip() for c in row):
+            continue
+
+        # Pick up new origin when cell is non-empty (blank = carry forward)
+        if origin_col < len(row) and row[origin_col].strip():
+            raw = row[origin_col].strip()
+            # Strip service parens, country/state codes, take city segment
+            raw = re.sub(r"\s*\([A-Za-z/]+\)\s*$", "", raw)
+            raw = re.sub(r",\s*[A-Z]{2}\s*$", "", raw.upper()).strip()
+            current_origin = raw.split(",")[0].strip()
+
+        if not current_origin:
+            continue
+
+        row_dict: dict = {}
+        has_rate = False
+
+        for col_idx, field in col_map.items():
+            if field in ("_ignore", "origin_city"):
+                continue
+            if col_idx >= len(row):
+                continue
+            cell = row[col_idx].strip()
+            if not cell or cell in ("-", "—", "--", "N/A", "n/a", "TBN", "None"):
+                continue
+
+            if field.startswith("base_rate") or field.startswith("agw"):
+                m = _NUMERIC_RE.search(cell)
+                if m:
+                    try:
+                        val = float(m.group(1).replace(",", ""))
+                        bounds = _RATE_BOUNDS.get(field)
+                        if not bounds or bounds[0] <= val <= bounds[1]:
+                            row_dict[field] = val
+                            if field.startswith("base_rate"):
+                                has_rate = True
+                    except ValueError:
+                        pass
+            else:
+                row_dict[field] = cell
+
+        if has_rate:
+            groups.setdefault(current_origin, []).append(row_dict)
+
+    return groups if groups else None
+
+
 # ── Annotate rows with contract metadata + surcharges ─────────────────────────
 
 def _numeric(val) -> float | None:
@@ -509,32 +843,87 @@ def _extract_section_rates(
     if not origin:
         return []
 
-    base_context = {
+    # ── Context enrichment ────────────────────────────────────────────────────
+    # Override global commodity with any per-section declaration in the raw text.
+    section_commodity = _infer_section_commodity(raw_text, commodity)
+
+    # Fill in missing via port from inline routing text when no ORIGIN VIA: header.
+    section_via = _infer_via_from_text(raw_text, origin_via)
+
+    base_context: dict = {
         "origin_city":     origin,
-        "origin_via_city": origin_via or None,
+        "origin_via_city": section_via or None,
         "scope":           scope,
         "service":         "CY/CY",
     }
 
-    # 1. Rule-based grid extraction
+    # ── Rule-based grid extraction ────────────────────────────────────────────
     rule_rows: list[dict] = []
+    # Keep the last successful column-map for detecting page-break continuations.
+    prev_col_map: dict[int, str] | None = None
+
     for grid in tables:
+        # Step 1: Expand cells that fold multiple rows via embedded newlines.
+        grid = _split_multiline_cells(grid)
+
+        # Step 2: Standard header-based grid extraction.
         rows = _extract_from_grid(grid, base_context)
         if rows:
+            # Save col_map for possible continuation on the next page.
+            _, prev_col_map = _detect_header_row(grid)
             rule_rows.extend(rows)
+            continue
+
+        # Step 3: Continuation table — same column structure but no header row.
+        #         Occurs when a rate table spans multiple pages; pdfplumber
+        #         creates a separate table object per page.
+        cont_map = _detect_continuation_table(grid, prev_col_map)
+        if cont_map is not None:
+            cont_rows = _extract_rows_with_colmap(grid, cont_map, base_context)
+            if cont_rows:
+                logger.debug(f"[cont] {len(cont_rows)} continuation rows for origin={origin}")
+                rule_rows.extend(cont_rows)
+            continue
+
+        # Step 4: Origin-as-column table — some PDFs embed origin as a column
+        #         instead of using ORIGIN: section headers.  Match rows whose
+        #         origin cell corresponds to the current section origin.
+        origin_groups = _extract_origin_grouped_from_table(grid, _RATE_COL)
+        if origin_groups:
+            for grp_origin, grp_rows in origin_groups.items():
+                # Accept an exact match or a prefix match to handle
+                # normalisation differences (e.g. "LOS ANGELES" vs "LOS ANGELES CA")
+                if (grp_origin == origin
+                        or origin.startswith(grp_origin)
+                        or grp_origin.startswith(origin)):
+                    for r in grp_rows:
+                        # Apply base context without overwriting already-set fields
+                        for k, v in base_context.items():
+                            r.setdefault(k, v)
+                        r.setdefault("service", "CY/CY")
+                    rule_rows.extend(grp_rows)
 
     if rule_rows:
-        _annotate_rows(rule_rows, carrier, contract_id, effective_date,
-                       expiration_date, commodity, scope, origin, origin_via, surcharges)
-        logger.info(f"[rule] {len(rule_rows)} rows for origin={origin}")
+        _annotate_rows(
+            rule_rows, carrier, contract_id, effective_date, expiration_date,
+            section_commodity, scope, origin, section_via, surcharges,
+        )
+        log_extra = ""
+        if section_via and section_via != origin_via:
+            log_extra += f"  via={section_via}"
+        if section_commodity != commodity:
+            log_extra += f"  cmdt={section_commodity}"
+        logger.info(f"[rule] {len(rule_rows)} rows  origin={origin}{log_extra}")
         return rule_rows
 
-    # 2. Text-line fallback
+    # ── Text-line fallback ────────────────────────────────────────────────────
     if raw_text.strip():
         text_rows = _extract_rates_from_text(raw_text, base_context)
         if text_rows:
-            _annotate_rows(text_rows, carrier, contract_id, effective_date,
-                           expiration_date, commodity, scope, origin, origin_via, surcharges)
+            _annotate_rows(
+                text_rows, carrier, contract_id, effective_date, expiration_date,
+                section_commodity, scope, origin, section_via, surcharges,
+            )
             logger.info(f"[text] {len(text_rows)} rows for origin={origin}")
             return text_rows
 

@@ -30,7 +30,20 @@
       "Read(//c/Users/Miles/AppData/Local/Programs/**)",
       "Bash(ls /c/Python*)",
       "Read(//c/Users/Miles/**)",
-      "Bash(del \"C:\\\\Users\\\\Miles\\\\OneDrive\\\\Dokumen\\\\hackathon\\\\backend\\\\ai\\\\prompts.py\")"
+      "Bash(del \"C:\\\\Users\\\\Miles\\\\OneDrive\\\\Dokumen\\\\hackathon\\\\backend\\\\ai\\\\prompts.py\")",
+      "Bash(python -c \"import ai.ollama_extractor as m; print\\(''OK — functions:'', [f for f in dir\\(m\\) if not f.startswith\\(''_''\\)]\\)\")",
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0, ''C:/Users/Miles/OneDrive/Dokumen/hackathon/backend''\\); import ai.ollama_extractor as m; print\\(''OK''\\)\")",
+      "Bash(py -3 -c \"import sys; sys.path.insert\\(0, ''C:/Users/Miles/OneDrive/Dokumen/hackathon/backend''\\); import ai.ollama_extractor as m; print\\(''OK''\\)\")",
+      "Bash(cmd.exe /c \"py -3 -c \"\"import sys; sys.path.insert\\(0, ''C:/Users/Miles/OneDrive/Dokumen/hackathon/backend''\\); import ai.ollama_extractor as m; print\\(''OK — new functions:'', [f for f in dir\\(m\\) if not f.startswith\\(''_''\\)]\\)\"\"\")",
+      "Bash(cmd /c \"cd /d C:\\\\Users\\\\Miles\\\\OneDrive\\\\Dokumen\\\\hackathon\\\\backend && py -3 -c \"\"import ai.ollama_extractor; print\\(''OK''\\)\"\"\")",
+      "Bash(cmd /c \"py -3 -c \"\"exit\\(\\)\"\"\")",
+      "Bash(cmd /c \"py -3 -c \"\"import ast, sys; ast.parse\\(open\\(''C:/Users/Miles/OneDrive/Dokumen/hackathon/backend/ai/ollama_extractor.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\"\"\")",
+      "Bash(cmd /c \"py -3 C:/Users/Miles/OneDrive/Dokumen/hackathon/backend/ai/test_syntax.py\")",
+      "Bash(cmd /c \"py -3 -c \"\"exec\\(open\\(''C:/Users/Miles/OneDrive/Dokumen/hackathon/backend/ai/ollama_extractor.py''\\).read\\(\\)\\); print\\(''OK''\\)\"\"\")",
+      "Bash(cmd /c \"py -3 -c \"\"import ast; src=open\\(''C:/Users/Miles/OneDrive/Dokumen/hackathon/backend/ai/ollama_extractor.py''\\).read\\(\\); ast.parse\\(src\\); print\\(''Syntax OK''\\)\"\" && echo done\")",
+      "Bash(cmd /c \"py -3 -c \"\"import ast; ast.parse\\(open\\(''C:/Users/Miles/OneDrive/Dokumen/hackathon/backend/ai/ollama_extractor.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\"\" 2>&1\")",
+      "Bash(cmd /c \"py -3 C:\\\\Users\\\\Miles\\\\OneDrive\\\\Dokumen\\\\hackathon\\\\_check_syntax.py\")",
+      "Bash(del \"C:\\\\Users\\\\Miles\\\\OneDrive\\\\Dokumen\\\\hackathon\\\\_check_syntax.py\")"
     ]
   }
 }
