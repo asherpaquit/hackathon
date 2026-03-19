@@ -56,13 +56,10 @@ async def broadcast(job_id: str, data: dict):
 
 @app.get("/api/health")
 def health():
-    from ai.ollama_extractor import check_ollama_health
-    ollama_status = check_ollama_health(settings.ollama_host)
     return {
         "status": "ok",
-        "ollama_running": ollama_status["running"],
-        "ollama_model": settings.ollama_model,
-        "ollama_models_available": ollama_status.get("models", []),
+        "mode": "nlp",
+        "ollama_running": False,
         "template_exists": settings.template_path.exists(),
     }
 
@@ -166,8 +163,8 @@ async def run_pipeline(job_id: str):
     filepath = job["filepath"]
 
     try:
-        await broadcast(job_id, {"status": "DOCLING_PROCESSING", "stage_pct": 10,
-                                  "message": "Parsing PDF structure with Docling…"})
+        await broadcast(job_id, {"status": "PDF_PARSING", "stage_pct": 10,
+                                  "message": "Parsing PDF structure…"})
 
         def do_extract():
             return extract_pdf(filepath)
@@ -185,15 +182,10 @@ async def run_pipeline(job_id: str):
             "message": f"{'Docling' if docling_used else 'pdfplumber'} extraction complete",
         })
 
-        await broadcast(job_id, {"status": "AI_PROCESSING", "stage_pct": 40})
+        await broadcast(job_id, {"status": "NLP_PROCESSING", "stage_pct": 40})
 
         def do_ai():
-            return extract_with_ollama(
-                extracted,
-                model=settings.ollama_model,
-                host=settings.ollama_host,
-                low_memory=settings.low_memory_mode,
-            )
+            return extract_with_ollama(extracted)
 
         structured = await loop.run_in_executor(None, do_ai)
         rows_count = (
@@ -202,7 +194,7 @@ async def run_pipeline(job_id: str):
             + len(structured.get("destination_arbitraries", []))
         )
         await broadcast(job_id, {
-            "status": "AI_PROCESSING",
+            "status": "NLP_PROCESSING",
             "stage_pct": 70,
             "rows_extracted": rows_count,
         })

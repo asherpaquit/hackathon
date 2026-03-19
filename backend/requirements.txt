@@ -9,13 +9,7 @@ pypdf>=4.0.0
 
 pillow>=11.0.0
 
-# Ollama runs as a local service — no Python package needed
-# All calls go through httpx REST (already listed below)
-
 openpyxl>=3.1.5
-
-httpx>=0.28.0
-requests>=2.32.3
 
 pandas>=2.3.0
 python-dateutil>=2.9.0

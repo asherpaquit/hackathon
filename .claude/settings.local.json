@@ -20,7 +20,17 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(gh api:*)",
       "Bash(curl:*)",
-      "Bash(find C:UsersAdministratorDocumentsGithubsoftpoint-mobilehackathon -maxdepth 2 -name *.txt -o -name *.env -o -name *.cfg -o -name *.toml -o -name *.ini)"
+      "Bash(find C:UsersAdministratorDocumentsGithubsoftpoint-mobilehackathon -maxdepth 2 -name *.txt -o -name *.env -o -name *.cfg -o -name *.toml -o -name *.ini)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''ai/ollama_extractor.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''ai/ollama_extractor.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")",
+      "Bash(py -c \"import ast; ast.parse\\(open\\(''ai/ollama_extractor.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")",
+      "Bash(where python:*)",
+      "Bash(where python3:*)",
+      "Bash(where py:*)",
+      "Read(//c/Users/Miles/AppData/Local/Programs/**)",
+      "Bash(ls /c/Python*)",
+      "Read(//c/Users/Miles/**)",
+      "Bash(del \"C:\\\\Users\\\\Miles\\\\OneDrive\\\\Dokumen\\\\hackathon\\\\backend\\\\ai\\\\prompts.py\")"
     ]
   }
 }

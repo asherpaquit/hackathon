@@ -1,149 +1,125 @@
-"""Hybrid freight extraction: rule-based for grids, LLM fallback — fully parallelized."""
+"""Pure NLP freight data extraction — no LLM or internet required."""
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-import httpx
+logger = logging.getLogger("nlp_extractor")
 
-from ai.prompts import (
-    SYSTEM_PROMPT,
-    METADATA_PROMPT,
-    RATES_PROMPT,
-    SURCHARGE_PROMPT,
-    ORIGIN_ARB_PROMPT,
-    DEST_ARB_PROMPT,
+
+# ── Surcharge NLP ─────────────────────────────────────────────────────────────
+
+_SURCHARGE_KW: dict[str, re.Pattern] = {
+    "ams_china_japan":     re.compile(r"\b(?:AMS|america\s+manifest(?:\s+system)?(?:\s+surcharge)?)\b", re.I),
+    "hea_heavy_surcharge": re.compile(r"\b(?:HEA|heavy\s+(?:lift|cargo|equipment|surcharge))\b", re.I),
+    "agw":                 re.compile(r"\b(?:AGW|arbitrary\s+gross\s+weight|arbitrary\s+weight)\b", re.I),
+    "rds_red_sea":         re.compile(r"\b(?:RDS|red\s+sea(?:\s+surcharge)?|redex)\b", re.I),
+}
+
+_SURCHARGE_VAL_RE = re.compile(
+    r"(?:USD?\s*\$?\s*|(?::\s*|=\s*))(\d[\d,]*(?:\.\d+)?)"
+    r"|(\d[\d,]*(?:\.\d+)?)\s*(?:USD|per\s+(?:BL|B/L|container|unit))",
+    re.I,
 )
-
-logger = logging.getLogger("ollama_extractor")
-
-# Reuse a single httpx client for connection pooling
-_client: httpx.Client | None = None
+_INCLUSIVE_RE = re.compile(r"\b(?:INCLUSIVE|INCLUDED|INCL\.?)\b", re.I)
+_TARIFF_RE    = re.compile(r"\b(?:AS\s+PER\s+TARIFF|TARIFF|AS\s+PER\s+RATE\s+TARIFF)\b", re.I)
 
 
-def _get_client() -> httpx.Client:
-    global _client
-    if _client is None or _client.is_closed:
-        _client = httpx.Client(timeout=300.0)
-    return _client
-
-
-# ── Ollama REST call ──────────────────────────────────────────────────────────
-
-def _call_ollama(
-    prompt: str,
-    model: str = "mistral:7b",
-    host: str = "http://localhost:11434",
-    max_tokens: int = 1024,
-    num_ctx: int = 2048,
-) -> str:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ],
-        "stream": False,
-        "format": "json",
-        "options": {
-            "temperature":    0.0,
-            "num_predict":    max_tokens,
-            "num_ctx":        num_ctx,
-            "top_p":          0.9,
-            "repeat_penalty": 1.05,
-        },
-    }
-    client = _get_client()
-    last_err: Exception | None = None
-    for attempt in range(3):
-        try:
-            response = client.post(f"{host}/api/chat", json=payload, timeout=120.0)
-            response.raise_for_status()
-            return response.json()["message"]["content"]
-        except Exception as e:
-            last_err = e
-            if attempt < 2:
-                time.sleep(attempt + 1)   # 1 s, 2 s
-    raise last_err  # type: ignore[misc]
-
-
-def _repair_json(text: str) -> str:
-    """Fix common LLM JSON formatting mistakes before parsing."""
-    # Strip markdown code fences
-    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
-    text = re.sub(r"\s*```$", "", text)
-    # Remove JS-style inline comments  // ...
-    text = re.sub(r"//[^\n\"]*", "", text)
-    # Remove trailing commas before ] or }
-    text = re.sub(r",\s*([}\]])", r"\1", text)
-    return text.strip()
-
-
-def _parse_json(text: str) -> Any:
-    text = _repair_json(text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # Try to extract the first array or object from the text
-    for pattern in [r"(\[[\s\S]*\])", r"(\{[\s\S]*\})"]:
-        m = re.search(pattern, text)
-        if m:
-            try:
-                return json.loads(_repair_json(m.group(1)))
-            except json.JSONDecodeError:
+def _extract_surcharges_regex(surcharge_text: str) -> dict:
+    """Extract surcharge values with regex — no LLM needed."""
+    result: dict = {}
+    lines = surcharge_text.split("\n")
+    for key, kw_re in _SURCHARGE_KW.items():
+        for idx, line in enumerate(lines):
+            if not kw_re.search(line):
                 continue
-    logger.warning(f"[ollama_extractor] JSON parse failed. Raw: {text[:300]}")
-    return {}
+            for candidate in [line] + ([lines[idx + 1]] if idx + 1 < len(lines) else []):
+                if _INCLUSIVE_RE.search(candidate):
+                    result[key] = "INCLUSIVE"; break
+                if _TARIFF_RE.search(candidate):
+                    result[key] = "TARIFF"; break
+                m = _SURCHARGE_VAL_RE.search(candidate)
+                if m:
+                    val_str = (m.group(1) or m.group(2) or "").replace(",", "")
+                    try:
+                        result[key] = float(val_str); break
+                    except ValueError:
+                        pass
+            if key in result:
+                break
+    return result
 
 
-def check_ollama_health(host: str = "http://localhost:11434") -> dict:
-    try:
-        with httpx.Client(timeout=5.0) as client:
-            r = client.get(f"{host}/api/tags")
-            r.raise_for_status()
-            models = [m["name"] for m in r.json().get("models", [])]
-            return {"running": True, "models": models}
-    except Exception as e:
-        return {"running": False, "models": [], "error": str(e)}
+# ── Metadata NLP ──────────────────────────────────────────────────────────────
+
+_CONTRACT_ID_EXTRA = re.compile(
+    r"(?:CONTRACT\s+(?:NUMBER|NO\.?|#)\s*[:\-]?\s*|REF(?:ERENCE)?\s+NO\.?\s*[:\-]?\s*)([A-Z0-9][\w\-]{3,})",
+    re.I,
+)
+_CARRIER_COLON_RE = re.compile(
+    r"(?:CONTRACTED?\s+)?CARRIER\s*[:\-]\s*([A-Za-z][\w\s,\.]+?)(?:\n|,|\.|;|$)",
+    re.I,
+)
+_DATE_EXTRA = [
+    re.compile(r"(?:Effective\s+Date[:\s]+|Eff\.\s+Date[:\s]+|From\s+Date[:\s]+)"
+               r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})", re.I),
+    re.compile(r"(?:Expir(?:ation|y)\s+Date[:\s]+|Exp\.?\s+Date[:\s]+|To\s+Date[:\s]+|Through[:\s]+)"
+               r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})", re.I),
+    re.compile(r"(?:Effective\s+Date[:\s]+|Eff\.\s+Date[:\s]+)"
+               r"([A-Za-z]+ \d{1,2},? \d{4}|\d{1,2} [A-Za-z]+ \d{4})", re.I),
+    re.compile(r"(?:Expir(?:ation|y)\s+Date[:\s]+|Exp\.?\s+Date[:\s]+)"
+               r"([A-Za-z]+ \d{1,2},? \d{4}|\d{1,2} [A-Za-z]+ \d{4})", re.I),
+]
+# YYYYMMDD date format as found in "< NOTE FOR COMMODITY >" blocks
+_DATE_YYYYMMDD_RE = re.compile(r"valid\s+from\s+(\d{4})(\d{2})(\d{2})\s+to\s+(\d{4})(\d{2})(\d{2})", re.I)
+
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
-# ── Text pre-filter ───────────────────────────────────────────────────────────
-
-_SEPARATOR_RE   = re.compile(r"^[-=_*~\s]{3,}$")
-_PAGE_HEADER_RE = re.compile(r"^(page\s*\d+|^\d+\s*$)", re.IGNORECASE)
-
-
-def _prefilter_text(text: str, max_chars: int = 4000) -> str:
-    """
-    Remove blank lines, separator lines, and page-number lines.
-    Also deduplicate lines that repeat 3+ times (boilerplate headers/footers).
-    Reduces token count by ~30-50% which speeds up small models significantly.
-    """
-    lines = text.split("\n")
-    counts: dict[str, int] = {}
-    kept: list[str] = []
-    for line in lines:
-        s = line.strip()
-        if not s:
-            continue
-        if _SEPARATOR_RE.match(s):
-            continue
-        if _PAGE_HEADER_RE.match(s):
-            continue
-        counts[s] = counts.get(s, 0) + 1
-        if counts[s] <= 2:           # Allow at most 2 occurrences (header + 1 repeat)
-            kept.append(line)
-    return "\n".join(kept)[:max_chars]
+def _yyyymmdd_to_dmy(year: str, month: str, day: str) -> str:
+    mon = _MONTHS[int(month) - 1]
+    return f"{int(day)} {mon} {int(year)}"
 
 
-# ── Rule-based grid extraction ────────────────────────────────────────────────
+def _extract_metadata_enhanced(text: str, existing: dict) -> dict:
+    meta = dict(existing)
+
+    if not meta.get("contract_id"):
+        m = _CONTRACT_ID_EXTRA.search(text)
+        if m:
+            meta["contract_id"] = m.group(1).strip()
+
+    if not meta.get("carrier"):
+        m = _CARRIER_COLON_RE.search(text)
+        if m:
+            meta["carrier"] = m.group(1).strip()
+
+    if not meta.get("effective_date"):
+        m = _DATE_EXTRA[0].search(text) or _DATE_EXTRA[2].search(text)
+        if m:
+            meta["effective_date"] = m.group(1).strip().rstrip(",")
+
+    if not meta.get("expiration_date"):
+        m = _DATE_EXTRA[1].search(text) or _DATE_EXTRA[3].search(text)
+        if m:
+            meta["expiration_date"] = m.group(1).strip().rstrip(",")
+
+    # YYYYMMDD dates from NOTE blocks (use first occurrence)
+    if not meta.get("effective_date") or not meta.get("expiration_date"):
+        m = _DATE_YYYYMMDD_RE.search(text)
+        if m:
+            if not meta.get("effective_date"):
+                meta["effective_date"] = _yyyymmdd_to_dmy(m.group(1), m.group(2), m.group(3))
+            if not meta.get("expiration_date"):
+                meta["expiration_date"] = _yyyymmdd_to_dmy(m.group(4), m.group(5), m.group(6))
+
+    return meta
+
+
+# ── Column header → field mappings ────────────────────────────────────────────
 
 _RATE_COL: dict[str, str] = {
     # ── 20' containers ──────────────────────────────────────────────────────────
@@ -152,30 +128,34 @@ _RATE_COL: dict[str, str] = {
     "20st": "base_rate_20", "20'st": "base_rate_20",
     "20dc": "base_rate_20", "20'dc": "base_rate_20",
     "20dv": "base_rate_20", "20'dv": "base_rate_20",
-    "teu": "base_rate_20",                          # Twenty-foot Equivalent Unit
+    "teu": "base_rate_20",
     "r20": "base_rate_20", "rate20": "base_rate_20", "rate 20": "base_rate_20",
     "20'gp/dc": "base_rate_20",
+    "d2": "base_rate_20",                           # ATL0347N25 code: D2 = 20'
     # ── 40' containers ──────────────────────────────────────────────────────────
     "40": "base_rate_40", "40'": "base_rate_40", '40"': "base_rate_40",
     "40ft": "base_rate_40", "40gp": "base_rate_40", "40'gp": "base_rate_40",
     "40dv": "base_rate_40", "40'dv": "base_rate_40",
     "40dc": "base_rate_40", "40'dc": "base_rate_40",
     "40st": "base_rate_40", "40'st": "base_rate_40",
-    "feu": "base_rate_40",                          # Forty-foot Equivalent Unit
+    "feu": "base_rate_40",
     "r40": "base_rate_40", "rate40": "base_rate_40", "rate 40": "base_rate_40",
     "40'gp/dc": "base_rate_40",
+    "d4": "base_rate_40",                           # ATL0347N25 code: D4 = 40'
     # ── 40HC containers ─────────────────────────────────────────────────────────
     "40hc": "base_rate_40h", "40h": "base_rate_40h", "40hq": "base_rate_40h",
     "40'hc": "base_rate_40h", "40'h": "base_rate_40h", "40'hq": "base_rate_40h",
     "40hicube": "base_rate_40h", "40hi": "base_rate_40h", "hc40": "base_rate_40h",
     "40'hi": "base_rate_40h", "40rhc": "base_rate_40h",
-    "hc": "base_rate_40h", "hq": "base_rate_40h",  # standalone column headers
+    "hc": "base_rate_40h", "hq": "base_rate_40h",
     "hi cube": "base_rate_40h", "high cube": "base_rate_40h", "highcube": "base_rate_40h",
     "40hc/hq": "base_rate_40h", "40'hc/hq": "base_rate_40h",
+    "d5": "base_rate_40h",                          # ATL0347N25 code: D5 = 40'HC
     # ── 45' containers ──────────────────────────────────────────────────────────
     "45": "base_rate_45", "45'": "base_rate_45", '45"': "base_rate_45",
     "45ft": "base_rate_45", "45hc": "base_rate_45", "45'hc": "base_rate_45",
     "45hq": "base_rate_45", "45'hq": "base_rate_45",
+    "d7": "base_rate_45",                           # ATL0347N25 code: D7 = 45'HC
     # ── Destination ─────────────────────────────────────────────────────────────
     "destination": "destination_city", "dest": "destination_city",
     "pod": "destination_city", "port of discharge": "destination_city",
@@ -187,6 +167,7 @@ _RATE_COL: dict[str, str] = {
     "discharge": "destination_city", "unloading": "destination_city",
     "unloading port": "destination_city", "to port": "destination_city",
     "portname": "destination_city", "port name": "destination_city",
+    "point": "destination_city",                    # ATL0347N25 arb table column
     # ── Via / transshipment ─────────────────────────────────────────────────────
     "via": "destination_via_city", "dest via": "destination_via_city",
     "destination via": "destination_via_city", "t/s": "destination_via_city",
@@ -194,10 +175,12 @@ _RATE_COL: dict[str, str] = {
     "tranship": "destination_via_city", "transhipment": "destination_via_city",
     "transshipment": "destination_via_city", "ts port": "destination_via_city",
     "t/s via": "destination_via_city", "via port": "destination_via_city",
+    "trunk lane": "destination_via_city",           # ATL0347N25 arb table column
     # ── Service ─────────────────────────────────────────────────────────────────
     "service": "service", "term": "service", "type": "service",
     "mode": "service", "service type": "service", "svc": "service",
     "move type": "service", "terms": "service", "incoterm": "service",
+    "service lane": "service",                      # ATL0347N25 arb table column
     # ── Remarks / notes ─────────────────────────────────────────────────────────
     "remarks": "remarks", "remark": "remarks", "note": "remarks",
     "notes": "remarks", "comment": "remarks", "comments": "remarks",
@@ -210,30 +193,40 @@ _RATE_COL: dict[str, str] = {
     "#": "_ignore", "item": "_ignore", "sr": "_ignore",
     "unit": "_ignore", "validity": "_ignore", "valid": "_ignore",
     "effective": "_ignore", "expiry": "_ignore",
-    "40ot": "_ignore", "40fr": "_ignore",   # Open Top / Flat Rack — not tracked
+    "40ot": "_ignore", "40fr": "_ignore",
+    "cmdt": "_ignore",                              # commodity column in arb tables
+    "box": "_ignore",                               # box type column
+    "lane": "_ignore",                              # generic lane column
 }
 
 _ARB_ORIGIN_EXTRA: dict[str, str] = {
     "origin": "origin_city", "pol": "origin_city",
     "inland origin": "origin_city", "origin city": "origin_city",
     "origin point": "origin_city", "port of loading": "origin_city",
+    "point": "origin_city",                         # ATL0347N25 arb column
     "via": "origin_via_city", "pol via": "origin_via_city",
     "trunk port": "origin_via_city",
+    "trunk lane": "origin_via_city",                # ATL0347N25 arb column
+    "service lane": "service",                      # ATL0347N25 arb column
     "agw 20": "agw_20", "agw20": "agw_20", "agw 20'": "agw_20",
     "agw 40": "agw_40", "agw40": "agw_40", "agw 40'": "agw_40",
     "agw 45": "agw_45", "agw45": "agw_45", "agw 45'": "agw_45",
+    "cmdt": "_ignore", "direct call": "_ignore",    # ATL0347N25 ignore columns
 }
 
 _ARB_DEST_EXTRA: dict[str, str] = {
     "destination": "destination_city", "inland dest": "destination_city",
     "dest city": "destination_city", "delivery point": "destination_city",
+    "point": "destination_city",                    # ATL0347N25 arb column
     "via": "destination_via_city", "trunk port": "destination_via_city",
+    "trunk lane": "destination_via_city",           # ATL0347N25 arb column
+    "service lane": "service",                      # ATL0347N25 arb column
+    "cmdt": "_ignore", "direct call": "_ignore",    # ATL0347N25 ignore columns
 }
 
-# Handles plain numbers like "360" AND commodity/rate codes like "R2/2298" → extracts 2298
+# Handles plain numbers "360" and commodity/rate codes "R2/2298" → extracts 2298
 _NUMERIC_RE = re.compile(r"(?:[A-Za-z]\d*/)?(\d[\d,]*(?:\.\d+)?)")
 
-# Sane bounds for ocean freight rates in USD — rejects obviously wrong values
 _RATE_BOUNDS: dict[str, tuple[float, float]] = {
     "base_rate_20":  (10.0, 30_000.0),
     "base_rate_40":  (10.0, 45_000.0),
@@ -245,14 +238,14 @@ _RATE_BOUNDS: dict[str, tuple[float, float]] = {
 }
 
 
+# ── Grid extraction ───────────────────────────────────────────────────────────
+
 def _normalize_header_key(cell: str) -> str:
     s = (cell.lower().strip()
          .replace("\u2018", "'").replace("\u2019", "'")
          .replace("\u201c", '"').replace("\u201d", '"')
-         .replace("'", "'").replace("'", "'"))
-    # Remove trailing colon, parens, extra spaces
+         .replace("\u2018", "'").replace("\u2019", "'"))
     s = re.sub(r"[:()\[\]]", "", s).strip()
-    # Collapse whitespace
     s = re.sub(r"\s+", " ", s)
     return s
 
@@ -264,7 +257,6 @@ def _detect_header_row(
     if col_source is None:
         col_source = _RATE_COL
 
-    # Pre-build compact-key lookup once per call
     compact_source = {re.sub(r"[^a-z0-9]", "", k): v for k, v in col_source.items()}
 
     for row_idx, row in enumerate(grid[:8]):
@@ -274,34 +266,28 @@ def _detect_header_row(
                 continue
             key = _normalize_header_key(cell)
 
-            # 1. Exact normalized match
             if key in col_source:
                 col_map[col_idx] = col_source[key]
                 continue
 
-            # 2. Compact match (strip all non-alphanumeric)
             compact = re.sub(r"[^a-z0-9]", "", key)
             if compact in compact_source:
                 col_map[col_idx] = compact_source[compact]
                 continue
 
-            # 3. Token-level match — split "BASE RATE 40HC" into tokens and
-            #    check each token (and adjacent pairs) against the lookup.
-            #    Only used for rate/destination/via columns to avoid false hits.
             tokens = re.split(r"[\s/'\"\-]+", key)
             for i, tok in enumerate(tokens):
                 tok_compact = re.sub(r"[^a-z0-9]", "", tok)
                 if tok_compact in compact_source:
                     field = compact_source[tok_compact]
-                    if field.startswith(("base_rate", "destination", "via")):
+                    if field.startswith(("base_rate", "destination", "origin", "via")):
                         col_map[col_idx] = field
                         break
-                # Also try pairs of adjacent tokens: "40 hc" → "40hc"
                 if i + 1 < len(tokens):
                     pair = tok_compact + re.sub(r"[^a-z0-9]", "", tokens[i + 1])
                     if pair in compact_source:
                         field = compact_source[pair]
-                        if field.startswith(("base_rate", "destination", "via")):
+                        if field.startswith(("base_rate", "destination", "origin", "via")):
                             col_map[col_idx] = field
                             break
 
@@ -326,12 +312,12 @@ def _extract_from_grid(
         if not any(c.strip() for c in row):
             continue
 
-        row_dict  = dict(context)
-        has_rate  = False
+        row_dict = dict(context)
+        has_rate = False
 
         for col_idx, field in col_map.items():
             if field == "_ignore":
-                continue  # explicitly ignored columns (Cntry, Cur, etc.)
+                continue
             if col_idx >= len(row):
                 continue
             cell = row[col_idx].strip()
@@ -345,7 +331,7 @@ def _extract_from_grid(
                         val = float(m.group(1).replace(",", ""))
                         bounds = _RATE_BOUNDS.get(field)
                         if bounds and not (bounds[0] <= val <= bounds[1]):
-                            logger.debug(f"[rule] Rate out of bounds: {field}={val}, skipping")
+                            logger.debug(f"[rule] Rate out of bounds: {field}={val}")
                             continue
                         row_dict[field] = val
                         if field.startswith("base_rate"):
@@ -363,32 +349,114 @@ def _extract_from_grid(
     return rows if rows else None
 
 
-def _annotate_rows(
-    rows: list[dict],
-    carrier: str, contract_id: str,
-    effective_date: str, expiration_date: str,
-    commodity: str, scope: str,
-    origin: str, origin_via: str,
-    surcharges: dict,
-) -> None:
-    for row in rows:
-        row.update({
-            "carrier":            carrier,
-            "contract_id":        contract_id,
-            "effective_date":     effective_date,
-            "expiration_date":    expiration_date,
-            "commodity":          commodity,
-            "scope":              scope,
-            "origin_city":        origin,
-            "origin_via_city":    origin_via or None,
-            "ams_china_japan":    _numeric(surcharges.get("ams_china_japan")),
-            "hea_heavy_surcharge": _numeric(surcharges.get("hea_heavy_surcharge")),
-            "agw":                _numeric(surcharges.get("agw")),
-            "rds_red_sea":        _numeric(surcharges.get("rds_red_sea")),
-        })
+# ── Text-line fallback ────────────────────────────────────────────────────────
+
+# Tokens that signal the start of rate values (not part of city name)
+_RATE_TOKEN_RE = re.compile(
+    r"^(?:\d[\d,]*(?:\.\d+)?|N/A|TARIFF|INCLUSIVE|INCL\.?|-)$", re.I
+)
+# Header line contains ≥2 of these rate column keywords
+_RATE_HDR_TOKEN_RE = re.compile(
+    r"\b(20['\"]?|40['\"]?(?:HC|HQ|H)?|45['\"]?|D[2457]|TEU|FEU)\b", re.I
+)
+# Skip lines that are clearly column headers or separators
+_SKIP_LINE_RE = re.compile(
+    r"\b(SERVICE|TERM|MODE|CURRENCY|CUR|CNTRY|COUNTRY|REMARKS|REMARK|"
+    r"DESTINATION|ORIGIN|VIA|TRUNK\s+LANE|SERVICE\s+LANE|POINT|BOX)\b",
+    re.I,
+)
 
 
-# ── Section extractors ────────────────────────────────────────────────────────
+def _extract_rates_from_text(text: str, context: dict) -> list[dict]:
+    """
+    Token-based fallback for rate extraction when no table grid is available.
+    Finds a header line containing rate column keywords, then parses subsequent
+    lines: leading alpha tokens → destination city, trailing numeric tokens → rates.
+    """
+    lines = [l for l in text.split("\n") if l.strip()]
+
+    # Phase 1: find header line with ≥2 rate column keywords
+    header_idx = -1
+    header_fields: list[str] = []
+    compact_source = {re.sub(r"[^a-z0-9]", "", k): v for k, v in _RATE_COL.items()}
+
+    for i, line in enumerate(lines[:15]):
+        fields: list[str] = []
+        for m in _RATE_HDR_TOKEN_RE.finditer(line):
+            tok_compact = re.sub(r"[^a-z0-9]", "", m.group(0).lower())
+            f = compact_source.get(tok_compact)
+            if f and f.startswith("base_rate"):
+                fields.append(f)
+        if len(fields) >= 2:
+            header_idx = i
+            header_fields = fields
+            break
+
+    if header_idx == -1:
+        return []
+
+    rows: list[dict] = []
+    for line in lines[header_idx + 1:]:
+        tokens = line.split()
+        if not tokens or re.match(r"^[-=\s]+$", line):
+            continue
+        if _SKIP_LINE_RE.search(line):
+            continue
+
+        # Split: city tokens (alpha/mixed) then rate tokens (numeric/keywords)
+        city_tokens: list[str] = []
+        rate_tokens: list[str] = []
+        in_rates = False
+
+        for tok in tokens:
+            if not in_rates and _RATE_TOKEN_RE.match(tok):
+                in_rates = True
+            if in_rates:
+                rate_tokens.append(tok)
+            else:
+                city_tokens.append(tok)
+
+        if not city_tokens or len(rate_tokens) < 2:
+            continue
+
+        dest = " ".join(city_tokens)
+        # Skip header-like destinations
+        if _SKIP_LINE_RE.search(dest):
+            continue
+
+        row = dict(context)
+        row["destination_city"] = dest
+        row.setdefault("service", "CY/CY")
+        has_rate = False
+
+        for i, field in enumerate(header_fields):
+            if i >= len(rate_tokens):
+                break
+            val = rate_tokens[i]
+            if val in ("-", "—", "N/A", "n/a"):
+                continue
+            if val.upper() == "TARIFF":
+                row[field] = "TARIFF"; continue
+            if val.upper() in ("INCLUSIVE", "INCL"):
+                row[field] = "INCLUSIVE"; continue
+            m = _NUMERIC_RE.search(val)
+            if m:
+                try:
+                    num = float(m.group(1).replace(",", ""))
+                    bounds = _RATE_BOUNDS.get(field)
+                    if not bounds or bounds[0] <= num <= bounds[1]:
+                        row[field] = num
+                        has_rate = True
+                except ValueError:
+                    pass
+
+        if has_rate:
+            rows.append(row)
+
+    return rows
+
+
+# ── Annotate rows with contract metadata + surcharges ─────────────────────────
 
 def _numeric(val) -> float | None:
     if val is None or val in ("TARIFF", "INCLUSIVE", ""):
@@ -399,12 +467,38 @@ def _numeric(val) -> float | None:
         return None
 
 
+def _annotate_rows(
+    rows: list[dict],
+    carrier: str, contract_id: str,
+    effective_date: str, expiration_date: str,
+    commodity: str, scope: str,
+    origin: str, origin_via: str,
+    surcharges: dict,
+) -> None:
+    for row in rows:
+        row.update({
+            "carrier":             carrier,
+            "contract_id":         contract_id,
+            "effective_date":      effective_date,
+            "expiration_date":     expiration_date,
+            "commodity":           commodity,
+            "scope":               scope,
+            "origin_city":         origin,
+            "origin_via_city":     origin_via or None,
+            "ams_china_japan":     _numeric(surcharges.get("ams_china_japan")),
+            "hea_heavy_surcharge": _numeric(surcharges.get("hea_heavy_surcharge")),
+            "agw":                 _numeric(surcharges.get("agw")),
+            "rds_red_sea":         _numeric(surcharges.get("rds_red_sea")),
+        })
+
+
+# ── Section extractors ────────────────────────────────────────────────────────
+
 def _extract_section_rates(
-    section: dict, model: str, host: str,
+    section: dict,
     carrier: str, contract_id: str,
     effective_date: str, expiration_date: str,
     commodity: str, surcharges: dict,
-    num_ctx: int = 4096, max_text: int = 4000,
 ) -> list[dict]:
     origin     = section.get("origin", "")
     origin_via = section.get("origin_via", "")
@@ -422,7 +516,7 @@ def _extract_section_rates(
         "service":         "CY/CY",
     }
 
-    # ── 1. Rule-based grid extraction ────────────────────────────────────────
+    # 1. Rule-based grid extraction
     rule_rows: list[dict] = []
     for grid in tables:
         rows = _extract_from_grid(grid, base_context)
@@ -435,45 +529,24 @@ def _extract_section_rates(
         logger.info(f"[rule] {len(rule_rows)} rows for origin={origin}")
         return rule_rows
 
-    # ── 2. LLM fallback ──────────────────────────────────────────────────────
-    if not raw_text.strip() and not tables:
-        return []
-
-    if tables:
-        grid_repr  = json.dumps(tables[:2], ensure_ascii=False)[:2000]
-        text_input = f"GRIDS:\n{grid_repr}\n\nTEXT:\n{_prefilter_text(raw_text, 1000)}"
-    else:
-        text_input = _prefilter_text(raw_text, max_text)
-
-    prompt = RATES_PROMPT.format(
-        carrier=carrier, contract_id=contract_id,
-        effective_date=effective_date, expiration_date=expiration_date,
-        commodity=commodity, scope=scope,
-        origin_city=origin, origin_via=origin_via or "",
-        text=text_input,
-    )
-    try:
-        raw  = _call_ollama(prompt, model=model, host=host, max_tokens=1024, num_ctx=num_ctx)
-        data = _parse_json(raw)
-        rows = data if isinstance(data, list) else data.get("rows", data.get("rates", []))
-        if isinstance(rows, list):
-            _annotate_rows(rows, carrier, contract_id, effective_date,
+    # 2. Text-line fallback
+    if raw_text.strip():
+        text_rows = _extract_rates_from_text(raw_text, base_context)
+        if text_rows:
+            _annotate_rows(text_rows, carrier, contract_id, effective_date,
                            expiration_date, commodity, scope, origin, origin_via, surcharges)
-            logger.info(f"[llm] {len(rows)} rows for origin={origin}")
-            return rows
-        return []
-    except Exception as e:
-        logger.error(f"[ollama_extractor] Rate extraction failed for origin={origin}: {e}")
-        return []
+            logger.info(f"[text] {len(text_rows)} rows for origin={origin}")
+            return text_rows
+
+    logger.debug(f"[nlp] No rates found for origin={origin}")
+    return []
 
 
 def _extract_arb_section(
-    arb_section: dict, arb_kind: str, prompt_template,
-    model: str, host: str,
+    arb_section: dict, arb_kind: str,
     carrier: str, contract_id: str,
     effective_date: str, expiration_date: str,
     commodity: str, scope: str,
-    num_ctx: int = 4096, max_text: int = 4000,
 ) -> list[dict]:
     raw_text = arb_section.get("raw_text", "")
     tables   = arb_section.get("tables", [])
@@ -488,7 +561,6 @@ def _extract_arb_section(
         "commodity": commodity, "scope": scope,
     }
 
-    # ── 1. Rule-based ────────────────────────────────────────────────────────
     rule_rows: list[dict] = []
     for grid in tables:
         rows = _extract_from_grid(grid, base_context, col_source=col_source)
@@ -499,60 +571,38 @@ def _extract_arb_section(
         logger.info(f"[rule] {len(rule_rows)} {arb_kind} arb rows")
         return rule_rows
 
-    # ── 2. LLM fallback ──────────────────────────────────────────────────────
-    if tables:
-        grid_repr  = json.dumps(tables[:2], ensure_ascii=False)[:2000]
-        text_input = f"GRIDS:\n{grid_repr}\n\nTEXT:\n{_prefilter_text(raw_text, 1000)}"
-    else:
-        text_input = _prefilter_text(raw_text, max_text)
-
-    prompt = prompt_template.format(
-        carrier=carrier, contract_id=contract_id,
-        effective_date=effective_date, expiration_date=expiration_date,
-        commodity=commodity, scope=scope,
-        text=text_input,
-    )
-    try:
-        raw  = _call_ollama(prompt, model=model, host=host, max_tokens=1024, num_ctx=num_ctx)
-        data = _parse_json(raw)
-        rows = data if isinstance(data, list) else data.get("rows", [])
-        if isinstance(rows, list):
-            for row in rows:
-                row.update({
-                    "carrier": carrier, "contract_id": contract_id,
-                    "effective_date": effective_date, "expiration_date": expiration_date,
-                    "commodity": commodity, "scope": scope,
-                })
-            logger.info(f"[llm] {len(rows)} {arb_kind} arb rows")
-            return rows
-    except Exception as e:
-        logger.error(f"[ollama_extractor] {arb_kind} arb extraction failed: {e}")
+    logger.debug(f"[nlp] No {arb_kind} arb rows found")
     return []
+
+
+# ── Health check stub (Ollama no longer required) ─────────────────────────────
+
+def check_ollama_health(host: str = "http://localhost:11434") -> dict:
+    """Returns a stub — Ollama is no longer required in NLP mode."""
+    return {"running": True, "models": [], "mode": "nlp"}
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def extract_with_ollama(
     extracted: dict,
-    model: str = "mistral:7b",
-    host: str = "http://localhost:11434",
-    max_workers: int = 0,           # 0 = auto-detect from CPU count
+    model: str = "",        # ignored — kept for API compatibility
+    host: str = "",         # ignored — kept for API compatibility
+    max_workers: int = 0,   # ignored — NLP is fast enough serially
     low_memory: bool = False,
 ) -> dict:
     """
-    Main entry: takes pdf_extractor output, returns structured freight data.
-    All LLM calls (metadata, surcharges, rates, arbs) run in ONE shared pool.
-    low_memory=True → 2 workers, smaller context, shorter input (for 8GB RAM machines).
+    Pure NLP extraction. No LLM, no internet, no GPU required.
+    All data is extracted using regex and rule-based grid parsing.
     """
-    if low_memory:
-        max_workers = 2
-    elif max_workers <= 0:
-        # Rule-based tasks complete in <1ms and saturate quickly.
-        # LLM tasks are bottlenecked by Ollama (serial inference), so >4 workers
-        # doesn't help for LLM but doesn't hurt either.
-        max_workers = min(os.cpu_count() or 4, 8)
-
     metadata = extracted.get("metadata", {})
+
+    # Enhance metadata with wider regex patterns
+    full_text = "\n".join(
+        s.get("raw_text", "") for s in extracted.get("sections", [])
+    )[:4000]
+    metadata = _extract_metadata_enhanced(full_text, metadata)
+
     carrier         = metadata.get("carrier", "")
     contract_id     = metadata.get("contract_id", "")
     effective_date  = metadata.get("effective_date", "")
@@ -565,104 +615,53 @@ def extract_with_ollama(
         if not s.get("scope"):
             s["scope"] = scope
 
-    # Default surcharges (used if no surcharge text or LLM fails)
-    surcharges = {
+    # Default surcharges (fallback if not found in text)
+    surcharges: dict = {
         "ams_china_japan":    35,
         "hea_heavy_surcharge": "TARIFF",
         "agw":                 "TARIFF",
         "rds_red_sea":         "INCLUSIVE",
     }
 
-    # ── ALL work in ONE thread pool — metadata, surcharges, rates, arbs ──────
-    all_rates:    list[dict] = []
-    origin_arbs:  list[dict] = []
-    dest_arbs:    list[dict] = []
+    # Extract surcharges with regex
+    surcharge_text = extracted.get("surcharge_text", "")
+    if surcharge_text.strip():
+        found = _extract_surcharges_regex(surcharge_text)
+        surcharges.update(found)
+        logger.info(f"[nlp] Surcharges: {found}")
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {}
+    # Extract rates for all sections
+    all_rates: list[dict] = []
+    for section in sections:
+        rows = _extract_section_rates(
+            section, carrier, contract_id,
+            effective_date, expiration_date,
+            commodity, surcharges,
+        )
+        all_rates.extend(rows)
 
-        # Metadata (if regex missed it)
-        if not all([carrier, contract_id]):
-            first_text = ""
-            if sections:
-                first_text = sections[0].get("raw_text", "")[:2000]
-            if first_text:
-                def do_metadata():
-                    raw = _call_ollama(METADATA_PROMPT.format(text=first_text),
-                                       model=model, host=host, max_tokens=256, num_ctx=2048)
-                    return _parse_json(raw)
-                futures[pool.submit(do_metadata)] = ("metadata", None)
+    # Extract origin arbitraries
+    origin_arbs: list[dict] = []
+    for arb in extracted.get("origin_arb_sections", []):
+        rows = _extract_arb_section(
+            arb, "ORIGIN", carrier, contract_id,
+            effective_date, expiration_date, commodity, scope,
+        )
+        origin_arbs.extend(rows)
 
-        # Surcharges
-        surcharge_text = extracted.get("surcharge_text", "")
-        if surcharge_text.strip():
-            def do_surcharges():
-                raw = _call_ollama(
-                    SURCHARGE_PROMPT.format(text=_prefilter_text(surcharge_text, 2000)),
-                    model=model, host=host, max_tokens=128, num_ctx=2048,
-                )
-                return _parse_json(raw)
-            futures[pool.submit(do_surcharges)] = ("surcharges", None)
+    # Extract destination arbitraries
+    dest_arbs: list[dict] = []
+    for arb in extracted.get("dest_arb_sections", []):
+        rows = _extract_arb_section(
+            arb, "DESTINATION", carrier, contract_id,
+            effective_date, expiration_date, commodity, scope,
+        )
+        dest_arbs.extend(rows)
 
-        # Tune context/input sizes based on available memory
-        rate_ctx      = 2048 if low_memory else 4096
-        rate_max_text = 2000 if low_memory else 4000
-
-        # Rate sections
-        for section in sections:
-            if not section.get("origin"):
-                continue
-            futures[pool.submit(
-                _extract_section_rates,
-                section, model, host,
-                carrier, contract_id, effective_date, expiration_date,
-                commodity, surcharges, rate_ctx, rate_max_text,
-            )] = ("rate", section.get("origin", "?"))
-
-        # Origin arbitraries
-        for arb in extracted.get("origin_arb_sections", []):
-            if arb.get("raw_text", "").strip() or arb.get("tables"):
-                futures[pool.submit(
-                    _extract_arb_section,
-                    arb, "ORIGIN", ORIGIN_ARB_PROMPT, model, host,
-                    carrier, contract_id, effective_date, expiration_date, commodity, scope,
-                    rate_ctx, rate_max_text,
-                )] = ("origin_arb", None)
-
-        # Destination arbitraries
-        for arb in extracted.get("dest_arb_sections", []):
-            if arb.get("raw_text", "").strip() or arb.get("tables"):
-                futures[pool.submit(
-                    _extract_arb_section,
-                    arb, "DESTINATION", DEST_ARB_PROMPT, model, host,
-                    carrier, contract_id, effective_date, expiration_date, commodity, scope,
-                    rate_ctx, rate_max_text,
-                )] = ("dest_arb", None)
-
-        # Collect results as they complete
-        for future in as_completed(futures):
-            task_type, label = futures[future]
-            try:
-                result = future.result()
-                if task_type == "metadata" and isinstance(result, dict):
-                    metadata.update(result)
-                    carrier         = metadata.get("carrier", carrier)
-                    contract_id     = metadata.get("contract_id", contract_id)
-                    effective_date  = metadata.get("effective_date", effective_date)
-                    expiration_date = metadata.get("expiration_date", expiration_date)
-                    commodity       = metadata.get("commodity", commodity)
-                    logger.info(f"[ollama_extractor] Metadata: {metadata}")
-                elif task_type == "surcharges" and isinstance(result, dict):
-                    surcharges.update(result)
-                    logger.info(f"[ollama_extractor] Surcharges: {surcharges}")
-                elif task_type == "rate" and isinstance(result, list):
-                    all_rates.extend(result)
-                elif task_type == "origin_arb" and isinstance(result, list):
-                    origin_arbs.extend(result)
-                elif task_type == "dest_arb" and isinstance(result, list):
-                    dest_arbs.extend(result)
-            except Exception as e:
-                logger.error(f"[ollama_extractor] {task_type} failed: {e}")
+    logger.info(
+        f"[nlp] Done — {len(all_rates)} rates, "
+        f"{len(origin_arbs)} origin arbs, {len(dest_arbs)} dest arbs"
+    )
 
     return {
         "metadata":                metadata,

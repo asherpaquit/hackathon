@@ -354,17 +354,23 @@ def _split_sections_from_elements(elements: list[dict], result: dict) -> None:
     arb_texts:      list[str]             = []
     arb_tables:     list[list[list[str]]] = []
     surcharge_lines: list[str]            = []
+    # Buffer for consecutive ORIGIN: headers that share one rate table
+    pending_origins: list[tuple[str, str]] = []  # (origin, via) pairs
 
     def flush_section():
-        nonlocal current_origin, current_via, current_texts, current_tables
+        nonlocal current_origin, current_via, current_texts, current_tables, pending_origins
         if current_origin and (current_texts or current_tables):
-            result["sections"].append({
-                "origin":     current_origin,
-                "origin_via": current_via,
-                "scope":      current_scope,
-                "raw_text":   "\n".join(current_texts),
-                "tables":     list(current_tables),
-            })
+            # Emit one section per pending origin (all share the same table/text)
+            all_origins = pending_origins + [(current_origin, current_via)]
+            for orig, via in all_origins:
+                result["sections"].append({
+                    "origin":     orig,
+                    "origin_via": via,
+                    "scope":      current_scope,
+                    "raw_text":   "\n".join(current_texts),
+                    "tables":     list(current_tables),
+                })
+        pending_origins = []
         current_origin = ""
         current_via    = ""
         current_texts  = []
@@ -418,8 +424,13 @@ def _split_sections_from_elements(elements: list[dict], result: dict) -> None:
 
         origin_m = ORIGIN_HEADER_RE.match(text)
         if origin_m:
-            flush_section()
-            current_origin = _clean_origin_name(origin_m.group(1))
+            new_origin = _clean_origin_name(origin_m.group(1))
+            if current_origin and not (current_texts or current_tables):
+                # Consecutive ORIGIN: headers with no content yet — buffer this one
+                pending_origins.append((current_origin, current_via))
+            else:
+                flush_section()
+            current_origin = new_origin
             current_via    = ""
             in_arb         = None
             continue
