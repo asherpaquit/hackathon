@@ -86,7 +86,8 @@
       "Bash(findstr /V \"Microsoft\\\\|Corporation\\\\|hackathon>\")",
       "Bash(cmd /c \"py -3 C:\\\\Users\\\\Miles\\\\OneDrive\\\\Dokumen\\\\hackathon\\\\_syntax_check.py > C:\\\\Users\\\\Miles\\\\OneDrive\\\\Dokumen\\\\hackathon\\\\_syntax_out.txt 2>&1\")",
       "Bash(cmd /c \"py -3 -c \"\"import ast; [print\\(''OK'', f\\) or None for f in [''C:/Users/Miles/OneDrive/Dokumen/hackathon/backend/extraction/pdf_extractor.py'',''C:/Users/Miles/OneDrive/Dokumen/hackathon/backend/ai/ollama_extractor.py''] if ast.parse\\(open\\(f\\).read\\(\\)\\) or True]\"\"\")",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(python -c \"import py_compile; [py_compile.compile\\(f, doraise=True\\) for f in [''ai/rules_extractor.py'', ''ai/ollama_extractor.py'', ''main.py'', ''excel/excel_writer.py'', ''mapping/schema.py'', ''mapping/field_mapper.py'']]\")"
     ]
   }
 }

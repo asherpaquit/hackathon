@@ -27,7 +27,15 @@ class RateRow:
     ams_china_japan: Optional[float] = None
     hea_heavy_surcharge: Optional[float] = None
     agw: Optional[float] = None
-    rds_red_sea: Optional[float] = None
+    rds_red_sea: Optional[str | float] = None  # float rate or "included" string
+    # Reefer-specific rate columns
+    reefer_rate_20: Optional[float] = None
+    reefer_rate_40: Optional[float] = None
+    reefer_rate_40h: Optional[float] = None
+    reefer_rate_nor40: Optional[float] = None   # Non-Operating Reefer 40
+    # Additional surcharges
+    meo: Optional[str] = None                    # MEO surcharge
+    pef: Optional[str] = None                    # PEF/PEL surcharge
 
 
 @dataclass

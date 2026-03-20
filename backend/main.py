@@ -182,10 +182,25 @@ async def run_pipeline(job_id: str):
             "message": f"{'Docling' if docling_used else 'pdfplumber'} extraction complete",
         })
 
+        # ── Extract contract rules (Sections 7-12) via Ollama LLM ──
+        rules = {}
+        rules_text = extracted.get("rules_text", "")
+        if rules_text.strip():
+            await broadcast(job_id, {"status": "EXTRACTING_RULES", "stage_pct": 37,
+                                      "message": "Extracting contract rules via LLM…"})
+            from ai.rules_extractor import extract_rules, check_ollama_available
+            if check_ollama_available(settings.ollama_host):
+                rules = await loop.run_in_executor(
+                    None,
+                    lambda: extract_rules(rules_text, settings.ollama_host, settings.ollama_model)
+                )
+                await broadcast(job_id, {"status": "EXTRACTING_RULES", "stage_pct": 39,
+                                          "message": f"Rules extracted: {len(rules.get('scope_dates', {}))} scopes"})
+
         await broadcast(job_id, {"status": "NLP_PROCESSING", "stage_pct": 40})
 
         def do_ai():
-            return extract_with_ollama(extracted)
+            return extract_with_ollama(extracted, rules=rules)
 
         structured = await loop.run_in_executor(None, do_ai)
         rows_count = (

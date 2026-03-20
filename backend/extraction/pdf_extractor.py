@@ -98,6 +98,7 @@ def _extract_with_pdfplumber(pdf_path: str) -> dict[str, Any]:
         "surcharge_text":      "",
         "origin_arb_sections": [],
         "dest_arb_sections":   [],
+        "rules_text":          "",       # Sections 7-12 text for LLM rules extraction
         "_docling":            False,
     }
 
@@ -131,6 +132,30 @@ def _extract_with_pdfplumber(pdf_path: str) -> dict[str, Any]:
     full_text = "\n".join(e["data"] for e in elements if e["type"] == "text")
     result["metadata"] = _extract_metadata(full_text[:3000])
     _split_sections_from_elements(elements, result)
+
+    # ── Extract sections 7-12 text for LLM rules extraction ──────────────────
+    # Find the last page containing an ORIGIN: header (end of rate sections).
+    # Everything after that is sections 7-12 (duration, provisions, exceptions).
+    last_origin_page = 0
+    for e in elements:
+        if e["type"] == "text" and ORIGIN_HEADER_RE.match(e["data"]):
+            last_origin_page = e["page"]
+    # Also consider the last page of arbitraries
+    last_arb_page = 0
+    for e in elements:
+        if e["type"] == "text" and ARBITRARY_RE.search(e["data"]):
+            last_arb_page = e["page"]
+    cutoff_page = max(last_origin_page, last_arb_page)
+    if cutoff_page > 0:
+        rules_lines = [
+            e["data"] for e in elements
+            if e["type"] == "text" and e["page"] > cutoff_page
+        ]
+        result["rules_text"] = "\n".join(rules_lines)
+        if rules_lines:
+            logger.info(f"[pdf_extractor] Collected {len(rules_lines)} lines of rules text "
+                        f"from pages {cutoff_page+1}–{result['pages_total']}")
+
     return result
 
 
@@ -258,9 +283,25 @@ def _extract_with_docling(pdf_path: str) -> dict[str, Any]:
         "surcharge_text":      "",
         "origin_arb_sections": [],
         "dest_arb_sections":   [],
+        "rules_text":          "",
         "_docling":            True,
     }
     _split_sections_from_elements(elements, result)
+
+    # Extract sections 7-12 text (same logic as pdfplumber path)
+    last_origin_page = 0
+    for e in elements:
+        if e["type"] == "text" and ORIGIN_HEADER_RE.match(e["data"]):
+            last_origin_page = e["page"]
+    last_arb_page = 0
+    for e in elements:
+        if e["type"] == "text" and ARBITRARY_RE.search(e["data"]):
+            last_arb_page = e["page"]
+    cutoff_page = max(last_origin_page, last_arb_page)
+    if cutoff_page > 0:
+        rules_lines = [e["data"] for e in elements if e["type"] == "text" and e["page"] > cutoff_page]
+        result["rules_text"] = "\n".join(rules_lines)
+
     return result
 
 

@@ -60,8 +60,10 @@ def map_rate_rows(structured: dict) -> list[RateRow]:
     seen: set[tuple] = set()
     rows = []
     for d in structured.get("rates", []):
-        # Skip rows with no rate data at all
-        if not any(_f(d.get(f)) for f in ("base_rate_20", "base_rate_40", "base_rate_40h", "base_rate_45")):
+        # Skip rows with no rate data at all (check both base and reefer columns)
+        rate_fields = ("base_rate_20", "base_rate_40", "base_rate_40h", "base_rate_45",
+                        "reefer_rate_20", "reefer_rate_40", "reefer_rate_40h", "reefer_rate_nor40")
+        if not any(_f(d.get(f)) for f in rate_fields):
             continue
         # Skip rows with no destination
         dest = normalize_port(d.get("destination_city", ""))
@@ -93,7 +95,13 @@ def map_rate_rows(structured: dict) -> list[RateRow]:
             ams_china_japan=_f(d.get("ams_china_japan")),
             hea_heavy_surcharge=_f(d.get("hea_heavy_surcharge")),
             agw=_f(d.get("agw")),
-            rds_red_sea=_f(d.get("rds_red_sea")),
+            rds_red_sea=d.get("rds_red_sea") if isinstance(d.get("rds_red_sea"), str) else _f(d.get("rds_red_sea")),
+            reefer_rate_20=_f(d.get("reefer_rate_20")),
+            reefer_rate_40=_f(d.get("reefer_rate_40")),
+            reefer_rate_40h=_f(d.get("reefer_rate_40h")),
+            reefer_rate_nor40=_f(d.get("reefer_rate_nor40")),
+            meo=d.get("meo"),
+            pef=d.get("pef"),
         )
         rows.append(row)
     return rows

@@ -1009,6 +1009,110 @@ def check_ollama_health(host: str = "http://localhost:11434") -> dict:
     return {"running": True, "models": [], "mode": "nlp"}
 
 
+# ── Rules application (post-processing with LLM-extracted rules) ─────────────
+
+def _normalize_scope_key(scope: str) -> str:
+    """Normalize a scope string for comparison."""
+    if not scope:
+        return ""
+    s = scope.upper().strip()
+    s = s.replace("\xa0", " ")       # non-breaking space → regular space
+    s = re.sub(r"\s+", " ", s)       # collapse whitespace
+    s = s.strip("[]() ")             # remove wrapping brackets/parens
+    return s
+
+
+def _match_scope(row_scope: str, scope_dict: dict) -> str | None:
+    """
+    Match a row's scope against the keys of a scope dict.
+    Returns the matching key, or None.
+    Tries exact match first, then substring match.
+    """
+    if not row_scope or not scope_dict:
+        return None
+    norm = _normalize_scope_key(row_scope)
+    # Pass 1: exact match (normalized)
+    for key in scope_dict:
+        if _normalize_scope_key(key) == norm:
+            return key
+    # Pass 2: row scope contains dict key or vice versa
+    for key in scope_dict:
+        nk = _normalize_scope_key(key)
+        if nk in norm or norm in nk:
+            return key
+    return None
+
+
+def _apply_rules(all_rates: list[dict], origin_arbs: list[dict],
+                 dest_arbs: list[dict], rules: dict) -> None:
+    """
+    Apply LLM-extracted rules to rate rows in-place.
+
+    1. Section 8 dates: override effective/expiry per scope
+    2. Section 12.C: RDS inclusion for dry cargo on specific scopes
+    3. Reefer column remapping: move base rates to reefer fields for reefer rows
+    """
+    scope_dates = rules.get("scope_dates", {})
+    scope_surcharges = rules.get("scope_surcharges", {})
+    reefer_codes = set(rules.get("reefer_codes", []))
+    glossary = rules.get("container_glossary", {})
+
+    # Build set of reefer container types from glossary
+    reefer_types = set()
+    for code, desc in glossary.items():
+        if code.upper().startswith("R") or "reefer" in desc.lower() or "RF" in desc.upper():
+            reefer_types.add(code.upper())
+
+    all_rows = list(all_rates) + list(origin_arbs) + list(dest_arbs)
+    dates_applied = 0
+    rds_applied = 0
+
+    for row in all_rows:
+        scope = row.get("scope", "")
+
+        # ── 1. Per-scope dates (Section 8) ──
+        date_key = _match_scope(scope, scope_dates)
+        if date_key:
+            sd = scope_dates[date_key]
+            if sd.get("effective"):
+                row["effective_date"] = sd["effective"]
+            if sd.get("expiry"):
+                row["expiration_date"] = sd["expiry"]
+            dates_applied += 1
+
+        # ── 2. RDS inclusion (Section 12.C) ──
+        surch_key = _match_scope(scope, scope_surcharges)
+        if surch_key:
+            sc = scope_surcharges[surch_key]
+            if sc.get("rds_included_for_dry") is True:
+                # Check if this is a dry cargo row (not reefer)
+                commodity = (row.get("commodity") or "").upper()
+                is_reefer = any(rc in commodity for rc in reefer_codes) or "REEFER" in commodity or "RF" in commodity
+                if not is_reefer:
+                    row["rds_red_sea"] = "included"
+                    rds_applied += 1
+
+        # ── 3. Reefer column remapping ──
+        commodity = (row.get("commodity") or "").upper()
+        is_reefer = any(rc in commodity for rc in reefer_codes) or "REEFER" in commodity or "RF" in commodity
+        if is_reefer:
+            # Move base rates to reefer columns
+            if row.get("base_rate_20"):
+                row["reefer_rate_20"] = row.pop("base_rate_20")
+            if row.get("base_rate_40"):
+                row["reefer_rate_40"] = row.pop("base_rate_40")
+            if row.get("base_rate_40h"):
+                row["reefer_rate_40h"] = row.pop("base_rate_40h")
+            if row.get("base_rate_45"):
+                row["reefer_rate_nor40"] = row.pop("base_rate_45")
+
+    if dates_applied or rds_applied:
+        logger.info(
+            f"[rules] Applied: {dates_applied} scope-date overrides, "
+            f"{rds_applied} RDS inclusions"
+        )
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def extract_with_ollama(
@@ -1017,6 +1121,7 @@ def extract_with_ollama(
     host: str = "",         # ignored — kept for API compatibility
     max_workers: int = 0,   # ignored — NLP is fast enough serially
     low_memory: bool = False,
+    rules: dict | None = None,
 ) -> dict:
     """
     Pure NLP extraction. No LLM, no internet, no GPU required.
@@ -1120,6 +1225,11 @@ def extract_with_ollama(
         f"[nlp] Done — {len(all_rates)} rates, "
         f"{len(origin_arbs)} origin arbs, {len(dest_arbs)} dest arbs"
     )
+
+    # Apply LLM-extracted rules (Section 7-12) as post-processing
+    if rules and any(rules.get(k) for k in ("scope_dates", "scope_surcharges", "reefer_codes")):
+        logger.info("[nlp] Applying LLM-extracted rules to rate rows...")
+        _apply_rules(all_rates, origin_arbs, dest_arbs, rules)
 
     return {
         "metadata":                metadata,

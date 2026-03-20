@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from typing import Optional
 
@@ -10,12 +11,137 @@ from openpyxl import load_workbook
 from mapping.field_mapper import map_rate_rows, map_origin_arb_rows, map_dest_arb_rows
 from mapping.schema import RateRow, OriginArbitraryRow, DestinationArbitraryRow
 
+logger = logging.getLogger("excel_writer")
+
 # Excel serial date epoch
 _EXCEL_EPOCH = date(1899, 12, 30)
 
-# ── Column mappings ─────────────────────────────────────────────────────────
+# ── Header → field name mapping (for dynamic column detection) ──────────────
 
-RATES_COLS = [
+_HEADER_TO_FIELD = {
+    # Exact matches (lowercased header text → field name)
+    "carrier": "carrier",
+    "contract id": "contract_id",
+    "effective_date": "effective_date",
+    "effective date": "effective_date",
+    "expiration_date": "expiration_date",
+    "expiration date": "expiration_date",
+    "commodity": "commodity",
+    "origin_city": "origin_city",
+    "origin city": "origin_city",
+    "origin_via_city": "origin_via_city",
+    "origin via city": "origin_via_city",
+    "origin via": "origin_via_city",
+    "destination_city": "destination_city",
+    "destination city": "destination_city",
+    "destination_via_city": "destination_via_city",
+    "destination via city": "destination_via_city",
+    "destination via": "destination_via_city",
+    "service": "service",
+    "remarks": "remarks",
+    "scope": "scope",
+    "baserate 20": "base_rate_20",
+    "baserate20": "base_rate_20",
+    "base rate 20": "base_rate_20",
+    "baserate 40": "base_rate_40",
+    "baserate40": "base_rate_40",
+    "base rate 40": "base_rate_40",
+    "baserate 40h": "base_rate_40h",
+    "baserate40h": "base_rate_40h",
+    "baserate 40hc": "base_rate_40h",
+    "base rate 40h": "base_rate_40h",
+    "base rate 40hc": "base_rate_40h",
+    "baserate 45": "base_rate_45",
+    "baserate45": "base_rate_45",
+    "base rate 45": "base_rate_45",
+    # Surcharges
+    "ams": "ams_china_japan",
+    "ams/aci": "ams_china_japan",
+    "hea": "hea_heavy_surcharge",
+    "agw": "agw",
+    "rds": "rds_red_sea",
+    "red sea": "rds_red_sea",
+    "meo": "meo",
+    "pef": "pef",
+    "pel": "pef",
+    # Reefer columns
+    "reefer 20": "reefer_rate_20",
+    "reefer20": "reefer_rate_20",
+    "reefer 40": "reefer_rate_40",
+    "reefer40": "reefer_rate_40",
+    "reefer 40h": "reefer_rate_40h",
+    "reefer 40hc": "reefer_rate_40h",
+    "reefer40h": "reefer_rate_40h",
+    "reefer40hc": "reefer_rate_40h",
+    "non operating reefer": "reefer_rate_nor40",
+    "non-operating reefer": "reefer_rate_nor40",
+    "nor 40": "reefer_rate_nor40",
+    "reefer 40 nor": "reefer_rate_nor40",
+}
+
+# Keyword-based fallback matching (checked if exact match fails)
+_HEADER_KEYWORDS = [
+    ("reefer", "40", "nor"),    # "Reefer40NOR" → reefer_rate_nor40
+    ("non", "oper", "reefer"),  # "Non Operating Reefer" → reefer_rate_nor40
+    ("reefer", "40h"),          # "Reefer40HC" → reefer_rate_40h
+    ("reefer", "40"),           # "Reefer40" → reefer_rate_40
+    ("reefer", "20"),           # "Reefer20" → reefer_rate_20
+    ("red", "sea"),             # "Red Sea Diversion" → rds_red_sea
+]
+_HEADER_KEYWORD_FIELDS = [
+    "reefer_rate_nor40",
+    "reefer_rate_nor40",
+    "reefer_rate_40h",
+    "reefer_rate_40",
+    "reefer_rate_20",
+    "rds_red_sea",
+]
+
+
+def _read_header_mapping(ws) -> list[str]:
+    """
+    Read row 1 headers from a worksheet and return a list of field names.
+    Handles varying template column layouts (LAX vs CHI vs ATL).
+    """
+    cols = []
+    for cell in ws[1]:
+        raw = (cell.value or "")
+        header = raw.strip().lower()
+        header = header.replace("_", " ").strip()
+
+        # Try direct exact match
+        field = _HEADER_TO_FIELD.get(header)
+
+        # Try without underscores/spaces collapsed
+        if not field:
+            collapsed = header.replace(" ", "")
+            for key, f in _HEADER_TO_FIELD.items():
+                if key.replace(" ", "") == collapsed:
+                    field = f
+                    break
+
+        # Try keyword-based matching
+        if not field:
+            for keywords, kw_field in zip(_HEADER_KEYWORDS, _HEADER_KEYWORD_FIELDS):
+                if all(kw in header for kw in keywords):
+                    field = kw_field
+                    break
+
+        if field:
+            cols.append(field)
+        else:
+            # Unknown column — store placeholder so column indices stay correct
+            col_letter = cell.column_letter
+            if header:
+                logger.debug(f"[excel_writer] Unknown header in col {col_letter}: '{raw}'")
+            cols.append(f"_unknown_{col_letter}")
+
+    return cols
+
+
+# ── Fallback hardcoded column mappings (used if header row is empty) ────────
+
+RATES_COLS_FALLBACK = [
     "carrier",           # A
     "contract_id",       # B
     "effective_date",    # C
@@ -102,6 +228,8 @@ def _write_rows(ws, start_row: int, rows: list, columns: list[str]) -> int:
     for i, row_obj in enumerate(rows):
         excel_row = start_row + i
         for col_idx, field in enumerate(columns, start=1):
+            if field.startswith("_unknown_"):
+                continue
             val = _cell_value(row_obj, field)
             ws.cell(row=excel_row, column=col_idx, value=val)
     return len(rows)
@@ -126,6 +254,17 @@ def write_excel(structured: dict, template_path: str, output_path: str) -> None:
 
     # ── Rates sheet ──────────────────────────────────────────────────────────
     ws_rates = wb["Rates"]
+
+    # Dynamic column mapping: read header row from template
+    rates_cols = _read_header_mapping(ws_rates)
+    # Validate: if header row was empty or unrecognizable, fall back to hardcoded
+    known = [c for c in rates_cols if not c.startswith("_unknown_")]
+    if len(known) < 5:
+        logger.warning("[excel_writer] Template header row unrecognizable, using fallback column mapping")
+        rates_cols = RATES_COLS_FALLBACK
+    else:
+        logger.info(f"[excel_writer] Dynamic column mapping: {len(known)} fields from {len(rates_cols)} columns")
+
     # Clear existing data rows (keep header row 1)
     max_existing = ws_rates.max_row
     if max_existing > 1:
@@ -133,7 +272,7 @@ def write_excel(structured: dict, template_path: str, output_path: str) -> None:
             for cell in row:
                 cell.value = None
 
-    _write_rows(ws_rates, start_row=2, rows=rate_rows, columns=RATES_COLS)
+    _write_rows(ws_rates, start_row=2, rows=rate_rows, columns=rates_cols)
 
     # ── Origin Arbitraries sheet ─────────────────────────────────────────────
     if "Origin Arbitraries" in wb.sheetnames and origin_arb_rows:
