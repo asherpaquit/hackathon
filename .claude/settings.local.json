@@ -91,7 +91,10 @@
       "Bash(wc -l C:UsersAdministratorDocumentsGithubsoftpoint-mobilehackathon/**/*.py)",
       "Bash(python -c \"from ai.ollama_extractor import extract_with_ollama; from mapping.normalizer import normalize_port; print\\(''All modules import successfully''\\)\")",
       "Bash(find C:UsersAdministratorDocumentsGithubsoftpoint-mobilehackathon -type f \\\\\\(-name *.bat -o -name *.ps1 \\\\\\))",
-      "Bash(find C:UsersAdministratorDocumentsGithubsoftpoint-mobilehackathon -maxdepth 1 -type f -name *example* -o -name *.md)"
+      "Bash(find C:UsersAdministratorDocumentsGithubsoftpoint-mobilehackathon -maxdepth 1 -type f -name *example* -o -name *.md)",
+      "Bash(python -c \"from excel.excel_writer import write_excel; print\\(''excel_writer OK''\\)\")",
+      "Bash(python -c \"from config import settings; print\\(''config OK, no template_path''\\)\")",
+      "Bash(python -c \"from main import app; print\\(''main.py OK''\\)\")"
     ]
   }
 }

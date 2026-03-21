@@ -16,7 +16,7 @@ const STAGE_HINT = {
   DOCLING_PROCESSING: 'Parsing table structure…',
   EXTRACTING_TEXT:    'Reading sections & text…',
   AI_PROCESSING:      'Rule-based + AI extraction…',
-  WRITING_EXCEL:      'Populating Excel template…',
+  WRITING_EXCEL:      'Generating Excel output…',
   COMPLETE:           'Done!',
 }
 

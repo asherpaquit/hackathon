@@ -60,7 +60,7 @@ def health():
         "status": "ok",
         "mode": "nlp",
         "ollama_running": False,
-        "template_exists": settings.template_path.exists(),
+        "template_exists": True,  # no template needed — generates from scratch
     }
 
 
@@ -126,10 +126,10 @@ def download_result(job_id: str):
     if not output or not Path(output).exists():
         raise HTTPException(404, "Output file not found")
 
-    filename = Path(job["filename"]).stem + "_extracted.xlsm"
+    filename = Path(job["filename"]).stem + "_extracted.xlsx"
     return FileResponse(
         output,
-        media_type="application/vnd.ms-excel.sheet.macroenabled.12",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=filename,
     )
 
@@ -182,20 +182,27 @@ async def run_pipeline(job_id: str):
             "message": f"{'Docling' if docling_used else 'pdfplumber'} extraction complete",
         })
 
-        # ── Extract contract rules (Sections 7-12) via Ollama LLM ──
+        # ── Extract contract rules (Sections 1-12) ──
+        # Rules are now ALWAYS extracted via regex (fast, reliable).
+        # Ollama LLM is used as an optional enhancement if available.
         rules = {}
         rules_text = extracted.get("rules_text", "")
         if rules_text.strip():
             await broadcast(job_id, {"status": "EXTRACTING_RULES", "stage_pct": 37,
-                                      "message": "Extracting contract rules via LLM…"})
-            from ai.rules_extractor import extract_rules, check_ollama_available
-            if check_ollama_available(settings.ollama_host):
-                rules = await loop.run_in_executor(
-                    None,
-                    lambda: extract_rules(rules_text, settings.ollama_host, settings.ollama_model)
+                                      "message": "Extracting contract rules…"})
+            from ai.rules_extractor import extract_rules
+            rules = await loop.run_in_executor(
+                None,
+                lambda: extract_rules(
+                    rules_text,
+                    host=settings.ollama_host,
+                    model=settings.ollama_model,
                 )
-                await broadcast(job_id, {"status": "EXTRACTING_RULES", "stage_pct": 39,
-                                          "message": f"Rules extracted: {len(rules.get('scope_dates', {}))} scopes"})
+            )
+            n_scopes = len(rules.get("scope_dates", {}))
+            n_surcharges = len(rules.get("scope_surcharges", {}))
+            await broadcast(job_id, {"status": "EXTRACTING_RULES", "stage_pct": 39,
+                                      "message": f"Rules: {n_scopes} scopes, {n_surcharges} surcharge configs"})
 
         await broadcast(job_id, {"status": "NLP_PROCESSING", "stage_pct": 40})
 
@@ -216,10 +223,10 @@ async def run_pipeline(job_id: str):
 
         await broadcast(job_id, {"status": "WRITING_EXCEL", "stage_pct": 85})
 
-        output_path = settings.output_dir / f"{job_id}_result.xlsm"
+        output_path = settings.output_dir / f"{job_id}_result.xlsx"
 
         def do_write():
-            write_excel(structured, str(settings.template_path), str(output_path))
+            write_excel(structured, str(output_path))
 
         await loop.run_in_executor(None, do_write)
 

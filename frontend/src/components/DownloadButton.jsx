@@ -16,7 +16,7 @@ export default function DownloadButton({ job }) {
     const blob = await res.blob()
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
-    const filename = (job.filename || 'contract').replace('.pdf', '') + '_extracted.xlsm'
+    const filename = (job.filename || 'contract').replace('.pdf', '') + '_extracted.xlsx'
     a.href = url
     a.download = filename
     a.click()
@@ -42,7 +42,7 @@ export default function DownloadButton({ job }) {
       <div>
         <h4 className="font-semibold text-white">Your Excel is ready!</h4>
         <p className="text-sm text-slate-400 mt-0.5">
-          {(job.rows_extracted || 0).toLocaleString()} rows extracted · XLSM with macros preserved
+          {(job.rows_extracted || 0).toLocaleString()} rows extracted · XLSX ready
         </p>
       </div>
 

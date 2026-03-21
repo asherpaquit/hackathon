@@ -31,6 +31,20 @@ SURCHARGE_RE      = re.compile(r"(surcharge|subject to|inclusive|AMS|HEA|AGW|RDS
 # These lines appear BEFORE the ORIGIN: header and carry the commodity context.
 COMMODITY_HDR_RE  = re.compile(r"^\s*(?:\d+\)\s*)?COMMODITY\s*[:\-]\s*(.+)$", re.IGNORECASE)
 
+# ── Section number detection (for sections 7-12 rules text) ──────────────────
+# Matches numbered section headers like:
+#   "7. PARTIES"  /  "8. DURATION"  /  "12. PROVISIONS"  /  "SECTION 7"
+# Used to precisely locate the rules text rather than relying on page position.
+_SECTION_NUM_RE = re.compile(
+    r"^(?:SECTION\s+)?([7-9]|1[0-2])\s*[.\)]\s+[A-Z]",
+    re.MULTILINE,
+)
+# Also match lower numbered sections so we can find where section 7 STARTS
+_SECTION_ANY_RE = re.compile(
+    r"^(?:SECTION\s+)?(\d{1,2})\s*[.\)]\s+[A-Z]",
+    re.MULTILINE,
+)
+
 # Contract header patterns
 CONTRACT_NO_RE    = re.compile(r"SERVICE\s+CONTRACT\s+NO[.:]?\s*([A-Z0-9]+)|Contract\s+No[.:]?\s*([A-Z0-9]+)", re.IGNORECASE)
 CARRIER_ABBREV_RE = re.compile(r"^([A-Z]{2,6})\s+SERVICE\s+CONTRACT", re.MULTILINE)
@@ -74,6 +88,90 @@ def extract_pdf(pdf_path: str) -> dict[str, Any]:
         except Exception as e2:
             logger.error(f"[pdf_extractor] Both extractors failed: {e2}")
             raise
+
+
+# ── Rules text extraction (shared across pdfplumber + Docling paths) ─────────
+
+def _extract_rules_text(
+    elements: list[dict],
+    full_text: str,
+    pages_total: int,
+) -> str:
+    """
+    Precisely extract the text of sections 7-12 for LLM rules parsing.
+
+    Strategy (tries in order, returns the first that yields text):
+      1. Section-number detection — scan for "7." / "SECTION 7" header lines
+         in the element stream. Grab all text from there to end-of-document.
+         This is the most accurate — works even when sections 7-12 are embedded
+         within the same pages as the rate tables.
+      2. Page-cutoff fallback — take everything after the last ORIGIN:/ARBITRARY
+         page.  Less precise but reliable when section numbers aren't present.
+    """
+    text_elements = [e for e in elements if e["type"] == "text"]
+
+    # ── Strategy 1: locate "7." or "SECTION 7" header in the element stream ──
+    sec7_idx = None
+    for i, e in enumerate(text_elements):
+        line = e["data"].strip()
+        # Match "7.", "7)", "SECTION 7", "7. PARTIES", "7. CONTRACT TERMS" etc.
+        if re.match(r"^(?:SECTION\s+)?7\s*[.\)]\s*[A-Z]", line, re.I):
+            sec7_idx = i
+            break
+        # Also catch lines that ARE just "7. PARTIES" split over two elements
+        if re.match(r"^(?:SECTION\s+)?7\s*[.\)]\s*$", line, re.I):
+            sec7_idx = i
+            break
+
+    if sec7_idx is not None:
+        rules_lines = [e["data"] for e in text_elements[sec7_idx:]]
+        if rules_lines:
+            logger.info(
+                f"[pdf_extractor] Rules text: {len(rules_lines)} lines "
+                f"from section-7 header (elem {sec7_idx})"
+            )
+            return "\n".join(rules_lines)
+
+    # ── Strategy 2: also try finding section 7 in the full_text string ────────
+    # Some PDFs keep the section header on the same line as the title
+    m7 = re.search(
+        r"(?:^|\n)(?:SECTION\s+)?7\s*[.\)]\s+\S",
+        full_text,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if m7:
+        rules_text = full_text[m7.start():].strip()
+        if len(rules_text) > 100:
+            logger.info(
+                f"[pdf_extractor] Rules text: {len(rules_text)} chars "
+                f"from section-7 in full_text"
+            )
+            return rules_text
+
+    # ── Strategy 3: page-cutoff fallback ──────────────────────────────────────
+    last_origin_page = 0
+    for e in elements:
+        if e["type"] == "text" and ORIGIN_HEADER_RE.match(e["data"]):
+            last_origin_page = e["page"]
+    last_arb_page = 0
+    for e in elements:
+        if e["type"] == "text" and ARBITRARY_RE.search(e["data"]):
+            last_arb_page = e["page"]
+    cutoff_page = max(last_origin_page, last_arb_page)
+    if cutoff_page > 0:
+        rules_lines = [
+            e["data"] for e in elements
+            if e["type"] == "text" and e["page"] > cutoff_page
+        ]
+        if rules_lines:
+            logger.info(
+                f"[pdf_extractor] Rules text: {len(rules_lines)} lines "
+                f"from page-cutoff (pages {cutoff_page + 1}–{pages_total})"
+            )
+            return "\n".join(rules_lines)
+
+    logger.warning("[pdf_extractor] Could not locate sections 7-12 text")
+    return ""
 
 
 # ── pdfplumber primary path (FAST — no PyTorch, no AI models) ────────────────
@@ -134,27 +232,7 @@ def _extract_with_pdfplumber(pdf_path: str) -> dict[str, Any]:
     _split_sections_from_elements(elements, result)
 
     # ── Extract sections 7-12 text for LLM rules extraction ──────────────────
-    # Find the last page containing an ORIGIN: header (end of rate sections).
-    # Everything after that is sections 7-12 (duration, provisions, exceptions).
-    last_origin_page = 0
-    for e in elements:
-        if e["type"] == "text" and ORIGIN_HEADER_RE.match(e["data"]):
-            last_origin_page = e["page"]
-    # Also consider the last page of arbitraries
-    last_arb_page = 0
-    for e in elements:
-        if e["type"] == "text" and ARBITRARY_RE.search(e["data"]):
-            last_arb_page = e["page"]
-    cutoff_page = max(last_origin_page, last_arb_page)
-    if cutoff_page > 0:
-        rules_lines = [
-            e["data"] for e in elements
-            if e["type"] == "text" and e["page"] > cutoff_page
-        ]
-        result["rules_text"] = "\n".join(rules_lines)
-        if rules_lines:
-            logger.info(f"[pdf_extractor] Collected {len(rules_lines)} lines of rules text "
-                        f"from pages {cutoff_page+1}–{result['pages_total']}")
+    result["rules_text"] = _extract_rules_text(elements, full_text, result["pages_total"])
 
     return result
 
@@ -258,9 +336,18 @@ def _extract_with_docling(pdf_path: str) -> dict[str, Any]:
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr                       = True
         pipeline_options.do_table_structure           = True
-        pipeline_options.table_structure_options.mode = TableFormerMode.FAST
-        pipeline_options.generate_page_images         = False
+        # ACCURATE mode handles merged cells and multi-row headers correctly
+        # — critical for freight contract tables with spanning header rows.
+        pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
+        pipeline_options.generate_page_images         = True   # needed for ACCURATE bbox
         pipeline_options.generate_picture_images      = False
+
+        try:
+            from docling.datamodel.pipeline_options import EasyOcrOptions
+            ocr_options = EasyOcrOptions(lang=["en"])
+            pipeline_options.ocr_options = ocr_options
+        except ImportError:
+            pass  # EasyOcrOptions not available — use defaults
 
         converter = DocumentConverter(
             format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
@@ -288,19 +375,8 @@ def _extract_with_docling(pdf_path: str) -> dict[str, Any]:
     }
     _split_sections_from_elements(elements, result)
 
-    # Extract sections 7-12 text (same logic as pdfplumber path)
-    last_origin_page = 0
-    for e in elements:
-        if e["type"] == "text" and ORIGIN_HEADER_RE.match(e["data"]):
-            last_origin_page = e["page"]
-    last_arb_page = 0
-    for e in elements:
-        if e["type"] == "text" and ARBITRARY_RE.search(e["data"]):
-            last_arb_page = e["page"]
-    cutoff_page = max(last_origin_page, last_arb_page)
-    if cutoff_page > 0:
-        rules_lines = [e["data"] for e in elements if e["type"] == "text" and e["page"] > cutoff_page]
-        result["rules_text"] = "\n".join(rules_lines)
+    # Extract sections 7-12 text (shared logic with pdfplumber path)
+    result["rules_text"] = _extract_rules_text(elements, full_text, pages_total)
 
     return result
 
