@@ -35,7 +35,9 @@ def _extract_surcharges_regex(surcharge_text: str) -> dict:
         for idx, line in enumerate(lines):
             if not kw_re.search(line):
                 continue
-            for candidate in [line] + ([lines[idx + 1]] if idx + 1 < len(lines) else []):
+            # Look ahead up to 3 lines for the surcharge value
+            lookahead = [line] + [lines[idx + j] for j in range(1, 4) if idx + j < len(lines)]
+            for candidate in lookahead:
                 if _INCLUSIVE_RE.search(candidate):
                     result[key] = "INCLUSIVE"; break
                 if _TARIFF_RE.search(candidate):
@@ -232,14 +234,17 @@ _ARB_DEST_EXTRA: dict[str, str] = {
 _NUMERIC_RE = re.compile(r"(?:[A-Za-z]\d*/)?(\d[\d,]*(?:\.\d+)?)")
 
 _RATE_BOUNDS: dict[str, tuple[float, float]] = {
-    "base_rate_20":  (10.0, 30_000.0),
-    "base_rate_40":  (10.0, 45_000.0),
-    "base_rate_40h": (10.0, 48_000.0),
-    "base_rate_45":  (10.0, 50_000.0),
+    "base_rate_20":  (0.0, 30_000.0),
+    "base_rate_40":  (0.0, 45_000.0),
+    "base_rate_40h": (0.0, 48_000.0),
+    "base_rate_45":  (0.0, 50_000.0),
     "agw_20":  (0.0, 6_000.0),
     "agw_40":  (0.0, 6_000.0),
     "agw_45":  (0.0, 6_000.0),
 }
+
+# Values that should be treated as rate = 0 (waived/free charges)
+_WAIVED_VALUES = {"WAIVED", "FREE", "WAIVE", "GRATIS", "NIL", "INCLUDED"}
 
 
 # ── Grid extraction ───────────────────────────────────────────────────────────
@@ -254,6 +259,45 @@ def _normalize_header_key(cell: str) -> str:
     return s
 
 
+def _match_row_to_colmap(
+    row: list[str],
+    col_source: dict[str, str],
+    compact_source: dict[str, str],
+) -> dict[int, str]:
+    """Match a single row's cells against column name dictionaries."""
+    col_map: dict[int, str] = {}
+    for col_idx, cell in enumerate(row):
+        if not cell or not cell.strip():
+            continue
+        key = _normalize_header_key(cell)
+
+        if key in col_source:
+            col_map[col_idx] = col_source[key]
+            continue
+
+        compact = re.sub(r"[^a-z0-9]", "", key)
+        if compact in compact_source:
+            col_map[col_idx] = compact_source[compact]
+            continue
+
+        tokens = re.split(r"[\s/'\"\-]+", key)
+        for i, tok in enumerate(tokens):
+            tok_compact = re.sub(r"[^a-z0-9]", "", tok)
+            if tok_compact in compact_source:
+                field = compact_source[tok_compact]
+                if field.startswith(("base_rate", "destination", "origin", "via")):
+                    col_map[col_idx] = field
+                    break
+            if i + 1 < len(tokens):
+                pair = tok_compact + re.sub(r"[^a-z0-9]", "", tokens[i + 1])
+                if pair in compact_source:
+                    field = compact_source[pair]
+                    if field.startswith(("base_rate", "destination", "origin", "via")):
+                        col_map[col_idx] = field
+                        break
+    return col_map
+
+
 def _detect_header_row(
     grid: list[list[str]],
     col_source: dict[str, str] | None = None,
@@ -263,41 +307,46 @@ def _detect_header_row(
 
     compact_source = {re.sub(r"[^a-z0-9]", "", k): v for k, v in col_source.items()}
 
-    for row_idx, row in enumerate(grid[:8]):
-        col_map: dict[int, str] = {}
-        for col_idx, cell in enumerate(row):
-            if not cell or not cell.strip():
-                continue
-            key = _normalize_header_key(cell)
-
-            if key in col_source:
-                col_map[col_idx] = col_source[key]
-                continue
-
-            compact = re.sub(r"[^a-z0-9]", "", key)
-            if compact in compact_source:
-                col_map[col_idx] = compact_source[compact]
-                continue
-
-            tokens = re.split(r"[\s/'\"\-]+", key)
-            for i, tok in enumerate(tokens):
-                tok_compact = re.sub(r"[^a-z0-9]", "", tok)
-                if tok_compact in compact_source:
-                    field = compact_source[tok_compact]
-                    if field.startswith(("base_rate", "destination", "origin", "via")):
-                        col_map[col_idx] = field
-                        break
-                if i + 1 < len(tokens):
-                    pair = tok_compact + re.sub(r"[^a-z0-9]", "", tokens[i + 1])
-                    if pair in compact_source:
-                        field = compact_source[pair]
-                        if field.startswith(("base_rate", "destination", "origin", "via")):
-                            col_map[col_idx] = field
-                            break
-
+    # Pass 1: single-row header detection
+    for row_idx, row in enumerate(grid[:15]):
+        col_map = _match_row_to_colmap(row, col_source, compact_source)
         rate_fields = [v for v in col_map.values() if v.startswith("base_rate")]
         if len(rate_fields) >= 2:
             return row_idx, col_map
+
+    # Pass 2: multi-row merged header detection
+    # Some PDFs have 2-row spanning headers where row N has category labels
+    # (e.g., "Container Type") and row N+1 has the actual column names
+    # (e.g., "20'", "40'", "40HC"). Merge consecutive pairs and re-check.
+    for row_idx in range(min(len(grid) - 1, 10)):
+        row_a = grid[row_idx]
+        row_b = grid[row_idx + 1]
+        # Merge: for each column, prefer the non-empty cell from row_b,
+        # falling back to row_a. This captures the more specific label.
+        max_cols = max(len(row_a), len(row_b))
+        merged: list[str] = []
+        for ci in range(max_cols):
+            cell_a = row_a[ci].strip() if ci < len(row_a) else ""
+            cell_b = row_b[ci].strip() if ci < len(row_b) else ""
+            # Prefer the cell that has content; if both have content,
+            # concatenate with space so "Container 20'" can match
+            if cell_b and cell_a:
+                merged.append(f"{cell_a} {cell_b}")
+            else:
+                merged.append(cell_b or cell_a)
+
+        col_map = _match_row_to_colmap(merged, col_source, compact_source)
+        # Also try row_b alone (it might have the actual headers)
+        col_map_b = _match_row_to_colmap(row_b, col_source, compact_source)
+        # Use whichever found more rate columns
+        rate_merged = [v for v in col_map.values() if v.startswith("base_rate")]
+        rate_b = [v for v in col_map_b.values() if v.startswith("base_rate")]
+        best_map = col_map if len(rate_merged) >= len(rate_b) else col_map_b
+        best_rate_count = max(len(rate_merged), len(rate_b))
+
+        if best_rate_count >= 2:
+            # Data rows start after the second header row
+            return row_idx + 1, best_map
 
     return -1, {}
 
@@ -329,6 +378,12 @@ def _extract_from_grid(
                 continue
 
             if field.startswith("base_rate") or field.startswith("agw"):
+                cell_upper = cell.upper().strip()
+                if cell_upper in _WAIVED_VALUES:
+                    row_dict[field] = 0.0
+                    if field.startswith("base_rate"):
+                        has_rate = True
+                    continue
                 m = _NUMERIC_RE.search(cell)
                 if m:
                     try:
@@ -357,7 +412,7 @@ def _extract_from_grid(
 
 # Tokens that signal the start of rate values (not part of city name)
 _RATE_TOKEN_RE = re.compile(
-    r"^(?:\d[\d,]*(?:\.\d+)?|N/A|TARIFF|INCLUSIVE|INCL\.?|-)$", re.I
+    r"^(?:\d[\d,]*(?:\.\d+)?|N/A|TARIFF|INCLUSIVE|INCL\.?|WAIVED|FREE|NIL|-)$", re.I
 )
 # Header line contains ≥2 of these rate column keywords
 _RATE_HDR_TOKEN_RE = re.compile(
@@ -384,7 +439,7 @@ def _extract_rates_from_text(text: str, context: dict) -> list[dict]:
     header_fields: list[str] = []
     compact_source = {re.sub(r"[^a-z0-9]", "", k): v for k, v in _RATE_COL.items()}
 
-    for i, line in enumerate(lines[:15]):
+    for i, line in enumerate(lines[:30]):
         fields: list[str] = []
         for m in _RATE_HDR_TOKEN_RE.finditer(line):
             tok_compact = re.sub(r"[^a-z0-9]", "", m.group(0).lower())
@@ -443,6 +498,8 @@ def _extract_rates_from_text(text: str, context: dict) -> list[dict]:
                 row[field] = "TARIFF"; continue
             if val.upper() in ("INCLUSIVE", "INCL"):
                 row[field] = "INCLUSIVE"; continue
+            if val.upper() in _WAIVED_VALUES:
+                row[field] = 0.0; has_rate = True; continue
             m = _NUMERIC_RE.search(val)
             if m:
                 try:
@@ -724,6 +781,12 @@ def _extract_rows_with_colmap(
                 continue
 
             if field.startswith("base_rate") or field.startswith("agw"):
+                cell_upper = cell.upper().strip()
+                if cell_upper in _WAIVED_VALUES:
+                    row_dict[field] = 0.0
+                    if field.startswith("base_rate"):
+                        has_rate = True
+                    continue
                 m = _NUMERIC_RE.search(cell)
                 if m:
                     try:
@@ -808,6 +871,12 @@ def _extract_origin_grouped_from_table(
                 continue
 
             if field.startswith("base_rate") or field.startswith("agw"):
+                cell_upper = cell.upper().strip()
+                if cell_upper in _WAIVED_VALUES:
+                    row_dict[field] = 0.0
+                    if field.startswith("base_rate"):
+                        has_rate = True
+                    continue
                 m = _NUMERIC_RE.search(cell)
                 if m:
                     try:
@@ -989,14 +1058,38 @@ def _extract_arb_section(
     }
 
     rule_rows: list[dict] = []
+    prev_col_map: dict[int, str] | None = None
+
     for grid in tables:
+        # Expand multiline cells
+        grid = _split_multiline_cells(grid)
+
+        # Standard header-based extraction
         rows = _extract_from_grid(grid, base_context, col_source=col_source)
         if rows:
+            _, prev_col_map = _detect_header_row(grid, col_source)
             rule_rows.extend(rows)
+            continue
+
+        # Continuation table detection (page-spanning arb tables)
+        cont_map = _detect_continuation_table(grid, prev_col_map)
+        if cont_map is not None:
+            cont_rows = _extract_rows_with_colmap(grid, cont_map, base_context)
+            if cont_rows:
+                logger.debug(f"[cont] {len(cont_rows)} continuation {arb_kind} arb rows")
+                rule_rows.extend(cont_rows)
+            continue
 
     if rule_rows:
         logger.info(f"[rule] {len(rule_rows)} {arb_kind} arb rows")
         return rule_rows
+
+    # Text-line fallback for arb sections
+    if raw_text.strip():
+        text_rows = _extract_rates_from_text(raw_text, base_context)
+        if text_rows:
+            logger.info(f"[text] {len(text_rows)} {arb_kind} arb rows from text fallback")
+            return text_rows
 
     logger.debug(f"[nlp] No {arb_kind} arb rows found")
     return []
